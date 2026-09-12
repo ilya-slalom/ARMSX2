@@ -94,6 +94,15 @@ object CustomDriver {
             "https://api.github.com/repos/WearyConcern1165/ExynosTools/releases",
             "exynostools",
         ),
+        // Balemuni/Balemunis-Aurora — "Apex" Mesa 26.3-devel Turnip builds tuned for Snapdragon
+        // 8 Gen 2 / Adreno 740 (AYN Thor) plus a universal a7xx pack. Standard adrenotools zips
+        // (meta.json + vulkan.freedreno.so at the root); their libc needs stop at LIBC_R (API 30),
+        // so unlike some purple-turnip builds they load on Android 13.
+        DriverSource(
+            "Balemuni · Aurora (Apex)",
+            "https://api.github.com/repos/Balemuni/Balemunis-Aurora/releases",
+            "balemuni",
+        ),
     )
 
     /** Sane default for the driver's library soname when meta.json
