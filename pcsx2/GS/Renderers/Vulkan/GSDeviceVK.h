@@ -561,7 +561,7 @@ private:
 		ShaderInterlace shader, Filter filter, const InterlaceConstantBuffer& cb) final;
 	void DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float params[4]) final;
 	void DoFXAA(GSTexture* sTex, GSTexture* dTex) final;
-	bool DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex) override;
+	bool DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t frame_count) override;
 
 	/// librashader filter chain state. The handle is void* rather than
 	/// libra_vk_filter_chain_t so this header doesn't need librashader.h — that header
@@ -571,7 +571,6 @@ private:
 	void* m_shader_chain = nullptr;
 	std::string m_shader_chain_preset;
 	bool m_shader_chain_failed = false;
-	size_t m_shader_frame_count = 0;
 	/// Last parameter-override generation pushed into m_shader_chain. Zeroed whenever the
 	/// chain is (re)created, because a new chain starts at the preset's initial values and
 	/// has to be re-fed regardless of whether the store changed.

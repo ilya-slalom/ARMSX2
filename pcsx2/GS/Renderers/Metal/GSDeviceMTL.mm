@@ -818,7 +818,6 @@ void GSDeviceMTL::DestroyShaderChain()
 #endif
 	m_shader_chain_preset.clear();
 	m_shader_chain_failed = false;
-	m_shader_frame_count = 0;
 	m_shader_param_generation = 0;
 }
 
@@ -844,7 +843,7 @@ void GSDeviceMTL::ApplyShaderChainParams()
 #endif
 }
 
-bool GSDeviceMTL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
+bool GSDeviceMTL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t frame_count)
 { @autoreleasepool {
 #ifndef ARMSX2_HAS_LIBRASHADER
 	return false;
@@ -876,7 +875,6 @@ bool GSDeviceMTL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 		}
 
 		m_shader_chain = chain;
-		m_shader_frame_count = 0;
 		m_shader_param_generation = 0;
 		Console.WriteLn("(GS) librashader: loaded preset '%s'", m_shader_chain_preset.c_str());
 	}
@@ -893,7 +891,7 @@ bool GSDeviceMTL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 
 	libra_mtl_filter_chain_t chain = static_cast<libra_mtl_filter_chain_t>(m_shader_chain);
 	if (libra_error_t err = libra_mtl_filter_chain_frame(
-			&chain, GetRenderCmdBuf(), m_shader_frame_count, src, dst, &vp, nullptr, nullptr))
+			&chain, GetRenderCmdBuf(), frame_count, src, dst, &vp, nullptr, nullptr))
 	{
 		ReportShaderChainError("frame", err);
 		m_shader_chain_failed = true;
@@ -903,7 +901,6 @@ bool GSDeviceMTL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 		FlushEncoders();
 		return false;
 	}
-	m_shader_frame_count++;
 	dTex->SetState(GSTexture::State::Dirty);
 
 	// librashader recycles per-frame objects over a ring shallower than our deferred-submit

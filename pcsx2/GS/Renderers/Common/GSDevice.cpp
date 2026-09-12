@@ -1402,7 +1402,10 @@ bool GSDevice::ApplyShaderChain(const GSVector2i& output_size, const GSVector2i&
 
 	// Only swap on success — a failed chain (bad preset, unsupported backend) must leave
 	// m_current pointing at the unshaded frame rather than at a target nothing rendered to.
-	if (!DoApplyShaderChain(sTex, dTex))
+	// Consumed before the call and advanced whether or not the frame succeeds: a failed
+	// preset does not make the next presented frame's parity any different.
+	const size_t frame_count = m_shader_chain_frame_count++;
+	if (!DoApplyShaderChain(sTex, dTex, frame_count))
 		return false;
 
 	m_shader_chain_loaded = true;

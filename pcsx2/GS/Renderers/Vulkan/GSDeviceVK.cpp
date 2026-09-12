@@ -4765,7 +4765,6 @@ void GSDeviceVK::DestroyShaderChain()
 #endif
 	m_shader_chain_preset.clear();
 	m_shader_chain_failed = false;
-	m_shader_frame_count = 0;
 	m_shader_param_generation = 0;
 }
 
@@ -4798,7 +4797,7 @@ void GSDeviceVK::ApplyShaderChainParams()
 #endif
 }
 
-bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
+bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t frame_count)
 {
 #ifndef ARMSX2_HAS_LIBRASHADER
 	return false;
@@ -4841,7 +4840,6 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 		}
 
 		m_shader_chain = chain;
-		m_shader_frame_count = 0;
 		// The new chain sits at the preset's initial values, so whatever we last pushed is
 		// gone with the old one — force ApplyShaderChainParams to feed it again.
 		m_shader_param_generation = 0;
@@ -4872,13 +4870,12 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 	// Every librashader entry point takes the chain handle by address, not by value.
 	libra_vk_filter_chain_t chain = static_cast<libra_vk_filter_chain_t>(m_shader_chain);
 	if (libra_error_t err = libra_vk_filter_chain_frame(&chain, GetCurrentCommandBuffer(),
-			m_shader_frame_count, in, out, &vp, nullptr, nullptr))
+			frame_count, in, out, &vp, nullptr, nullptr))
 	{
 		ReportShaderChainError("frame", err);
 		m_shader_chain_failed = true;
 		return false;
 	}
-	m_shader_frame_count++;
 
 	// The chain left the target in COLOR_ATTACHMENT_OPTIMAL behind the tracker's back, so
 	// resync it WITHOUT emitting a barrier (Override), then transition for real to the

@@ -6,6 +6,7 @@
 #include "GS/Renderers/Common/GSRenderer.h"
 #include "GS/Renderers/Common/GSInterlaceModePolicy.h"
 #include "GS/Renderers/Common/GSPresentationPolicy.h"
+#include "GS/Renderers/Common/GSCompositionSkipPolicy.h"
 #include "GS/Renderers/Common/GSSnapshotPolicy.h"
 #include "GS/GSCapture.h"
 #include "GS/GSDump.h"
@@ -924,17 +925,21 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		}
 	}
 
-	// The GS has already processed draw commands and framebuffer writes before VSync. A cap-skipped
-	// frame can omit display-only work when no image consumer is active.
+	// The GS has already processed draw commands and framebuffer writes before VSync. Any frame that
+	// will not be presented — duplicate skip, manual skip or the presentation cap — can omit the
+	// display-only work when no image consumer is active: see GSCompositionSkipPolicy.h. This used
+	// to require a cap-created skip plus GSGetPresentCapRenderSkip(); that gate still picks the
+	// pool-aging variant below but no longer keeps duplicate frames on the full-render path, which
+	// ran the whole RetroArch shader chain twice per displayed frame on every 30 fps title.
 	// Interlaced frames take a separate history-only path below so temporal deinterlacing remains
-	// correct. Requiring an actual cap-created skip keeps duplicate/manual skips on master's
-	// original full-render path when the default 60 FPS mode is selected.
-	const bool request_skipped_final_render =
-		fps_cap_present_skip && GSGetPresentCapRenderSkip() &&
-		GSIsHardwareRenderer() &&
-		m_regs->EXTWRITE.WRITE == 0 &&
-		m_snapshot.empty() && !m_dump && m_dump_frames == 0 && !GSCapture::IsCapturingVideo() &&
-		!GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()) && g_gs_device->GetCurrent() != nullptr;
+	// correct.
+	const bool request_skipped_final_render = ShouldSkipUnpresentedComposition(
+		skip_frame,
+		GSIsHardwareRenderer(),
+		m_regs->EXTWRITE.WRITE != 0,
+		!m_snapshot.empty() || m_dump || m_dump_frames != 0 || GSCapture::IsCapturingVideo() ||
+			GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()),
+		g_gs_device->GetCurrent() != nullptr);
 
 	bool merged_frame;
 	if (!request_skipped_final_render)
@@ -952,6 +957,11 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		merged_frame = Merge<MergeMode::SkipFinalComposition>(field);
 	}
 	const bool skipped_final_render = request_skipped_final_render && merged_frame;
+	// The chain did not run, but its FrameCount must still advance: shaders key phase-alternating
+	// effects (NTSC artifact phase) off it, and RetroArch feeds them one count per emulated frame
+	// whether or not that frame was a duplicate.
+	if (skipped_final_render && GSConfig.ShaderChainEnabled && !GSConfig.ShaderChainPreset.empty())
+		g_gs_device->NoteShaderChainFrameSkipped();
 	const bool blank_frame = !merged_frame;
 	// Run length, not just "was blank": the policy below distinguishes a single alternating blank
 	// (an interlaced-field artefact, safe to drop) from a run of them (a fade the game is actually

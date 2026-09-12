@@ -1535,6 +1535,11 @@ protected:
 	/// Whether a chain is loaded in the backend, so ApplyShaderChain can free it on the
 	/// frame the player turns shaders off rather than polling for it.
 	bool m_shader_chain_loaded = false;
+	/// FrameCount handed to the chain. Advances once per VSync — including frames whose
+	/// composition was skipped (NoteShaderChainFrameSkipped) — so parity-driven effects such
+	/// as NTSC phase alternation see exactly the cadence RetroArch gives them: one count per
+	/// emulated frame, duplicates included. Owned here rather than per backend for that reason.
+	size_t m_shader_chain_frame_count = 0;
 	GSTexture* m_cas = nullptr;
 	GSTexture* m_mfx_output = nullptr; ///< MetalFX spatial upscale destination (Metal backend).
 	GSTexture* m_fsr1_easu = nullptr; ///< FSR1 EASU output, at display size; RCAS reads it back.
@@ -1569,7 +1574,7 @@ protected:
 	/// skipped — the caller then leaves m_current alone, so an unsupported backend or
 	/// a bad preset degrades to "no shader" instead of a black screen. NOT pure: only
 	/// the Vulkan/OpenGL devices override it, everything else keeps the no-op.
-	virtual bool DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex) { return false; }
+	virtual bool DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t frame_count) { return false; }
 
 	/// Free whatever the chain is holding. A loaded chain owns a render target and a
 	/// pipeline per pass and the collection runs to forty of them, so leaving it resident
@@ -2034,6 +2039,9 @@ public:
 	/// Returns true if the chain ran and m_current now points at the shaded target. The chain
 	/// itself lives in DoApplyShaderChain, which only librashader-capable backends override.
 	bool ApplyShaderChain(const GSVector2i& output_size, const GSVector2i& source_size);
+	/// Advances the chain's FrameCount for a VSync whose composition (and therefore chain) was
+	/// skipped because the frame will not be presented. See m_shader_chain_frame_count.
+	void NoteShaderChainFrameSkipped() { m_shader_chain_frame_count++; }
 	void Resize(int width, int height);
 
 	void CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool sharpen_only);

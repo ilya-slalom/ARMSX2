@@ -421,7 +421,7 @@ public:
 	void DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, ShaderInterlace shader, Filter filter, const InterlaceConstantBuffer& cb) override;
 	void DoFXAA(GSTexture* sTex, GSTexture* dTex) override;
 	void DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float params[4]) override;
-	bool DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex) override;
+	bool DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t frame_count) override;
 
 	/// librashader filter chain state. The handle is void* rather than
 	/// libra_mtl_filter_chain_t so this header needs nothing librashader generates — that
@@ -432,7 +432,6 @@ public:
 	void* m_shader_chain = nullptr;
 	std::string m_shader_chain_preset;
 	bool m_shader_chain_failed = false;
-	size_t m_shader_frame_count = 0;
 	u64 m_shader_param_generation = 0;
 	void DestroyShaderChain();
 	void ReleaseShaderChain() override { DestroyShaderChain(); }
