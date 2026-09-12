@@ -1540,6 +1540,11 @@ protected:
 	/// as NTSC phase alternation see exactly the cadence RetroArch gives them: one count per
 	/// emulated frame, duplicates included. Owned here rather than per backend for that reason.
 	size_t m_shader_chain_frame_count = 0;
+	/// Chain source (native-res downscale of m_current) and target (on-screen size). Dedicated
+	/// rather than ping-ponged over m_merge/m_target_tmp — those get resized back to internal
+	/// size by the next Merge(), which deleted and re-created two full-size textures per frame.
+	GSTexture* m_shader_chain_source = nullptr;
+	GSTexture* m_shader_chain_target = nullptr;
 	GSTexture* m_cas = nullptr;
 	GSTexture* m_mfx_output = nullptr; ///< MetalFX spatial upscale destination (Metal backend).
 	GSTexture* m_fsr1_easu = nullptr; ///< FSR1 EASU output, at display size; RCAS reads it back.
