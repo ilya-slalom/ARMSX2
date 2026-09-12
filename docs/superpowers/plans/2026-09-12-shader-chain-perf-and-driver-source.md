@@ -197,6 +197,16 @@ In `ApplyShaderChain`, replace the final block:
 
 ### Task 4: Conditional mid-frame submit + safe chain teardown (optimization 3)
 
+> **Outcome (2026-09-12):** the conditional submit was implemented, built and tested on the AYN
+> Thor (Adreno 740, Qualcomm 0676.53) and REVERTED. Without a submit directly after
+> `libra_vk_filter_chain_frame` every presented frame was black. Bisected on-device with
+> runtime switches: dedicated textures + submit = correct; old ping-pong + no submit = black;
+> full ALL_COMMANDS memory barrier, transfer-layout round trip, vkCmdBlitImage copy, and
+> binding the pipeline before pushing descriptors all still black; GPU reset counter flat.
+> Only the submit fixes it. The safe teardown (drain before `libra_vk_filter_chain_free`)
+> was kept. Since Task 2 already removes the chain from unpresented frames, the remaining
+> cost is one extra submit per presented frame.
+
 **Files:**
 - Modify: `pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h` (replace `m_shader_frame_count` slot with `u64 m_shader_chain_fence_counter = 0`)
 - Modify: `pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp` (`DoApplyShaderChain`, `DestroyShaderChain`)

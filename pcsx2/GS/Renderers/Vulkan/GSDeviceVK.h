@@ -572,11 +572,6 @@ private:
 	void* m_shader_chain = nullptr;
 	std::string m_shader_chain_preset;
 	bool m_shader_chain_failed = false;
-	/// Fence counter of the command buffer that recorded the last chain frame. librashader
-	/// recycles frame N-3's per-frame objects when frame N records, which is only safe when no
-	/// two chain frames share one submit; DoApplyShaderChain kicks the buffer before recording
-	/// a second chain frame into it, and only then.
-	u64 m_shader_chain_fence_counter = 0;
 	/// Last parameter-override generation pushed into m_shader_chain. Zeroed whenever the
 	/// chain is (re)created, because a new chain starts at the preset's initial values and
 	/// has to be re-fed regardless of whether the store changed.

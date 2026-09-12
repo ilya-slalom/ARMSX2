@@ -4788,7 +4788,6 @@ void GSDeviceVK::DestroyShaderChain()
 #endif
 	m_shader_chain_preset.clear();
 	m_shader_chain_failed = false;
-	m_shader_chain_fence_counter = 0;
 	m_shader_param_generation = 0;
 }
 
@@ -4892,18 +4891,6 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t fra
 	// The chain records its own render passes, so it must not run inside one of ours.
 	EndRenderPass();
 
-	// librashader recycles its per-frame objects (VkImageView / VkFramebuffer / descriptor
-	// sets) over a `frames_in_flight`-deep ring (default 3): frame N destroys what frame N-3
-	// recorded. Our NUM_COMMAND_BUFFERS (3) ring waits for a buffer's previous submit before
-	// reusing it, so that is safe exactly when no two chain frames share a submit: N-3 then
-	// sits at least three submits back and its fence has been waited. A frame that never
-	// presents (blank, FIFO throttle) would record the next chain frame into this SAME buffer
-	// and break that — kick the buffer first, and only in that case. Steady state stays at one
-	// submit per frame instead of the unconditional mid-frame submit this used to do.
-	if (m_shader_chain_fence_counter == GetCurrentFenceCounter())
-		ExecuteCommandBuffer(false);
-	m_shader_chain_fence_counter = GetCurrentFenceCounter();
-
 	// librashader's contract: source in SHADER_READ_ONLY_OPTIMAL, target in
 	// COLOR_ATTACHMENT_OPTIMAL.
 	src->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
@@ -4934,15 +4921,24 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t fra
 	dst->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
 	dst->SetState(GSTexture::State::Dirty);
 
-	// The chain bound its own pipelines, descriptor sets, vertex buffer, viewport and scissor
-	// into OUR command buffer. The unconditional submit that used to follow every chain frame
-	// hid that by starting a fresh buffer (MoveToNextCommandBuffer does exactly these two
-	// calls); without it the presenter would trust a state cache that no longer describes the
-	// buffer and draw with librashader's leftovers — a black screen. Same shape as the GL
-	// backend's RestoreGLStateAfterShaderChain.
-	InvalidateCachedState();
-	SetInitialState(GetCurrentCommandBuffer());
-
+	// librashader recycles its per-frame objects (VkImageView / VkFramebuffer / descriptor
+	// sets) on its OWN internal frame counter, over a `frames_in_flight`-deep ring
+	// (default 3): frame N destroys what frame N-3 recorded. That is only safe if every
+	// frame() call is followed by a submit, so the fence for N-3 has been waited by the
+	// time N recycles its slot. Skipped presents (SkipDuplicateFrames, the FIFO throttle)
+	// never reach EndPresent, so without this kick three skipped frames in a row would let
+	// librashader destroy views still bound in the buffer being recorded
+	// (VUID-vkDestroyImageView-imageView-01026, then an Adreno segfault at submit).
+	//
+	// Attempted 2026-09-12: submitting only when a second chain frame would land in the
+	// same buffer (fence-counter tracked), with the state cache invalidated and re-applied.
+	// On an Adreno 740 (Qualcomm 0676.53) every frame then presented BLACK: the chain's
+	// final pass produced no pixels whenever it was not followed by its own submit — a
+	// full ALL_COMMANDS memory barrier, a transfer-layout round trip, a vkCmdBlitImage
+	// copy and re-ordering pipeline/descriptor binds all made no difference, while the
+	// submit alone fixed it. Composition skipping (GSCompositionSkipPolicy) already removes
+	// the chain from unpresented frames, so this costs one extra submit per PRESENTED frame.
+	ExecuteCommandBuffer(false);
 	return true;
 #endif
 }
