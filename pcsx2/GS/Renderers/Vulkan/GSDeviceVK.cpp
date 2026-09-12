@@ -4934,6 +4934,15 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t fra
 	dst->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
 	dst->SetState(GSTexture::State::Dirty);
 
+	// The chain bound its own pipelines, descriptor sets, vertex buffer, viewport and scissor
+	// into OUR command buffer. The unconditional submit that used to follow every chain frame
+	// hid that by starting a fresh buffer (MoveToNextCommandBuffer does exactly these two
+	// calls); without it the presenter would trust a state cache that no longer describes the
+	// buffer and draw with librashader's leftovers — a black screen. Same shape as the GL
+	// backend's RestoreGLStateAfterShaderChain.
+	InvalidateCachedState();
+	SetInitialState(GetCurrentCommandBuffer());
+
 	return true;
 #endif
 }
