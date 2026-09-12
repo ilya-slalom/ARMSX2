@@ -529,6 +529,10 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 #endif
 
 	m_optional_extensions.vk_ext_fragment_shader_interlock = SupportsExtension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, false);
+	// Consumed by the RetroArch shader chain only: in render-pass mode librashader creates and
+	// later destroys one VkFramebuffer per pass per frame (18 for a big CRT preset). The GS's own
+	// passes keep using render pass objects.
+	m_optional_extensions.vk_khr_dynamic_rendering = SupportsExtension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, false);
 
 	return true;
 }
@@ -718,6 +722,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
 	VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fragment_shader_interlock_ext_feature = {
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+	VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic_rendering_feature = {
+		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
 
 	// An advertised EXTENSION does not guarantee its FEATURE bit, and asking for a feature the
 	// driver does not have fails vkCreateDevice outright with VK_ERROR_FEATURE_NOT_PRESENT —
@@ -743,6 +749,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
 		VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT probe_fsi = {
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+		VkPhysicalDeviceDynamicRenderingFeaturesKHR probe_dr = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
 
 		// Only chain what we would actually enable: querying a struct whose extension is absent is
 		// not something the spec promises anything about.
@@ -759,6 +767,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			Vulkan::AddPointerToChain(&probe, &probe_sm1);
 		if (m_optional_extensions.vk_ext_fragment_shader_interlock)
 			Vulkan::AddPointerToChain(&probe, &probe_fsi);
+		if (m_optional_extensions.vk_khr_dynamic_rendering)
+			Vulkan::AddPointerToChain(&probe, &probe_dr);
 		vkGetPhysicalDeviceFeatures2(m_physical_device, &probe);
 
 		// Returns the flag rather than taking it by reference: m_optional_extensions members are
@@ -792,6 +802,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		m_optional_extensions.vk_ext_fragment_shader_interlock = keep("VK_EXT_fragment_shader_interlock",
 			m_optional_extensions.vk_ext_fragment_shader_interlock,
 			probe_fsi.fragmentShaderPixelInterlock == VK_TRUE);
+		m_optional_extensions.vk_khr_dynamic_rendering = keep("VK_KHR_dynamic_rendering",
+			m_optional_extensions.vk_khr_dynamic_rendering, probe_dr.dynamicRendering == VK_TRUE);
 
 		// Depth ROAA is an optional sub-feature: a driver can offer the extension and colour
 		// access yet not depth.
@@ -831,6 +843,12 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	{
 		fragment_shader_interlock_ext_feature.fragmentShaderPixelInterlock = VK_TRUE;
 		Vulkan::AddPointerToChain(&device_info, &fragment_shader_interlock_ext_feature);
+	}
+
+	if (m_optional_extensions.vk_khr_dynamic_rendering)
+	{
+		dynamic_rendering_feature.dynamicRendering = VK_TRUE;
+		Vulkan::AddPointerToChain(&device_info, &dynamic_rendering_feature);
 	}
 
 	VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
@@ -4758,6 +4776,11 @@ void GSDeviceVK::DestroyShaderChain()
 #ifdef ARMSX2_HAS_LIBRASHADER
 	if (m_shader_chain)
 	{
+		// free() destroys the chain's images, views and pipelines immediately. The last chain
+		// frame may still sit in the buffer being recorded, or be executing on the GPU: drain
+		// both before pulling its resources out from under them. Preset changes only.
+		if (GetCurrentCommandBuffer() != VK_NULL_HANDLE && !m_last_submit_failed)
+			ExecuteCommandBuffer(true);
 		libra_vk_filter_chain_t chain = static_cast<libra_vk_filter_chain_t>(m_shader_chain);
 		libra_vk_filter_chain_free(&chain);
 		m_shader_chain = nullptr;
@@ -4765,7 +4788,6 @@ void GSDeviceVK::DestroyShaderChain()
 #endif
 	m_shader_chain_preset.clear();
 	m_shader_chain_failed = false;
-	m_shader_frame_count = 0;
 	m_shader_param_generation = 0;
 }
 
@@ -4798,7 +4820,7 @@ void GSDeviceVK::ApplyShaderChainParams()
 #endif
 }
 
-bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
+bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t frame_count)
 {
 #ifndef ARMSX2_HAS_LIBRASHADER
 	return false;
@@ -4832,8 +4854,20 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 
 		// create() invalidates `preset` unconditionally ("the shader preset is
 		// immediately invalidated"), so it must NOT be freed afterwards on either path.
+		filter_chain_vk_opt_t opt = {};
+		opt.version = LIBRASHADER_CURRENT_VERSION;
+		opt.frames_in_flight = 0; // default (3) — the same depth as NUM_COMMAND_BUFFERS.
+		opt.force_no_mipmaps = false;
+		// Render-pass mode creates and later destroys a VkFramebuffer per pass per frame; dynamic
+		// rendering has none. librashader resolves the CORE vkCmdBeginRendering name through
+		// vkGetDeviceProcAddr and quietly falls back to render passes when that is null, so make
+		// the same check here and say in the log which path the device actually took.
+		opt.use_dynamic_rendering = m_optional_extensions.vk_khr_dynamic_rendering &&
+			vkGetDeviceProcAddr(m_device, "vkCmdBeginRendering") != nullptr;
+		opt.disable_cache = false;
+
 		libra_vk_filter_chain_t chain = nullptr;
-		if (libra_error_t err = libra_vk_filter_chain_create(&preset, vk, nullptr, &chain))
+		if (libra_error_t err = libra_vk_filter_chain_create(&preset, vk, &opt, &chain))
 		{
 			ReportShaderChainError("chain create", err);
 			m_shader_chain_failed = true;
@@ -4841,11 +4875,11 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 		}
 
 		m_shader_chain = chain;
-		m_shader_frame_count = 0;
 		// The new chain sits at the preset's initial values, so whatever we last pushed is
 		// gone with the old one — force ApplyShaderChainParams to feed it again.
 		m_shader_param_generation = 0;
-		Console.WriteLn("(GS) librashader: loaded preset '%s'", m_shader_chain_preset.c_str());
+		Console.WriteLn("(GS) librashader: loaded preset '%s' (dynamic rendering %s)",
+			m_shader_chain_preset.c_str(), opt.use_dynamic_rendering ? "on" : "off");
 	}
 
 	// GS thread, chain alive, before the frame call — the only place a set_param is safe.
@@ -4872,13 +4906,12 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 	// Every librashader entry point takes the chain handle by address, not by value.
 	libra_vk_filter_chain_t chain = static_cast<libra_vk_filter_chain_t>(m_shader_chain);
 	if (libra_error_t err = libra_vk_filter_chain_frame(&chain, GetCurrentCommandBuffer(),
-			m_shader_frame_count, in, out, &vp, nullptr, nullptr))
+			frame_count, in, out, &vp, nullptr, nullptr))
 	{
 		ReportShaderChainError("frame", err);
 		m_shader_chain_failed = true;
 		return false;
 	}
-	m_shader_frame_count++;
 
 	// The chain left the target in COLOR_ATTACHMENT_OPTIMAL behind the tracker's back, so
 	// resync it WITHOUT emitting a barrier (Override), then transition for real to the
@@ -4892,20 +4925,19 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 	// sets) on its OWN internal frame counter, over a `frames_in_flight`-deep ring
 	// (default 3): frame N destroys what frame N-3 recorded. That is only safe if every
 	// frame() call is followed by a submit, so the fence for N-3 has been waited by the
-	// time N recycles its slot.
+	// time N recycles its slot. Skipped presents (SkipDuplicateFrames, the FIFO throttle)
+	// never reach EndPresent, so without this kick three skipped frames in a row would let
+	// librashader destroy views still bound in the buffer being recorded
+	// (VUID-vkDestroyImageView-imageView-01026, then an Adreno segfault at submit).
 	//
-	// PCSX2 violates that. GSRenderer::VSync calls Merge() -- and therefore the chain --
-	// BEFORE it decides whether to present, and a skipped present (SkipDuplicateFrames,
-	// which is default-on, or the FIFO present throttle) returns early from DoBeginPresent
-	// and never reaches EndPresent, so it never submits. MAX_SKIPPED_DUPLICATE_FRAMES is
-	// 3 -- exactly the ring depth -- so three skipped frames in a row let librashader
-	// destroy views that are still bound to the command buffer we are STILL recording.
-	// Validation names it: VUID-vkDestroyImageView-imageView-01026, followed by the
-	// buffer going invalid and the Adreno driver segfaulting as it walks it at submit.
-	//
-	// Kicking the buffer here keeps exactly one submit per chain frame, so librashader's
-	// ring and our NUM_COMMAND_BUFFERS ring advance together. The GL backend is immune
-	// because it executes immediately and has no recorded buffer to go stale.
+	// Attempted 2026-09-12: submitting only when a second chain frame would land in the
+	// same buffer (fence-counter tracked), with the state cache invalidated and re-applied.
+	// On an Adreno 740 (Qualcomm 0676.53) every frame then presented BLACK: the chain's
+	// final pass produced no pixels whenever it was not followed by its own submit — a
+	// full ALL_COMMANDS memory barrier, a transfer-layout round trip, a vkCmdBlitImage
+	// copy and re-ordering pipeline/descriptor binds all made no difference, while the
+	// submit alone fixed it. Composition skipping (GSCompositionSkipPolicy) already removes
+	// the chain from unpresented frames, so this costs one extra submit per PRESENTED frame.
 	ExecuteCommandBuffer(false);
 	return true;
 #endif

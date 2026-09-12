@@ -1230,6 +1230,8 @@ void GSDevice::ClearCurrent()
 	delete m_mfx_output;
 	delete m_fsr1_easu;
 	delete m_fsr1_output;
+	delete m_shader_chain_source;
+	delete m_shader_chain_target;
 
 	m_merge = nullptr;
 	m_weavebob = nullptr;
@@ -1240,6 +1242,8 @@ void GSDevice::ClearCurrent()
 	m_mfx_output = nullptr;
 	m_fsr1_easu = nullptr;
 	m_fsr1_output = nullptr;
+	m_shader_chain_source = nullptr;
+	m_shader_chain_target = nullptr;
 }
 
 void GSDevice::Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c)
@@ -1344,6 +1348,10 @@ bool GSDevice::ApplyShaderChain(const GSVector2i& output_size, const GSVector2i&
 	{
 		ReleaseShaderChain();
 		m_shader_chain_loaded = false;
+		delete m_shader_chain_source;
+		delete m_shader_chain_target;
+		m_shader_chain_source = nullptr;
+		m_shader_chain_target = nullptr;
 	}
 	if (!wanted || !m_current)
 		return false;
@@ -1359,12 +1367,18 @@ bool GSDevice::ApplyShaderChain(const GSVector2i& output_size, const GSVector2i&
 	// into horizontal moire), and each such pass runs at ~16x the pixel count for no visual gain.
 	// Downscaling to native first is what RetroArch does implicitly by feeding a console's own
 	// output. Skipped at 1x (source already native) or when the caller passes {0,0}.
+	//
+	// The source and target below are DEDICATED textures, not m_merge/m_target_tmp. Sharing those
+	// looked free but was not: the chain's on-screen-sized output landed in m_merge, the next
+	// Merge() resized it back to internal size, and ResizeRenderTarget's recycle=false path
+	// deletes rather than pools — so at any upscale above 1x two full-size images were destroyed
+	// and re-created every frame, on the GS thread, for nothing.
 	GSTexture* sTex = m_current;
-	if (source_size.x > 0 && source_size.y > 0 &&
-		(sTex->GetWidth() > source_size.x || sTex->GetHeight() > source_size.y))
+	const bool downscale = source_size.x > 0 && source_size.y > 0 &&
+		(sTex->GetWidth() > source_size.x || sTex->GetHeight() > source_size.y);
+	if (downscale)
 	{
-		GSTexture*& nTex = (m_current == m_target_tmp) ? m_merge : m_target_tmp;
-		if (ResizeRenderTarget(&nTex, source_size.x, source_size.y, false, false))
+		if (ResizeRenderTarget(&m_shader_chain_source, source_size.x, source_size.y, false, false))
 		{
 			// Turn the discarded upscale detail into supersampling AA rather than throwing it
 			// away: a single bilinear tap reads one 2x2 corner of each NxN footprint and drops
@@ -1380,33 +1394,41 @@ bool GSDevice::ApplyShaderChain(const GSVector2i& output_size, const GSVector2i&
 			if (fx >= 2 && fx == fy && fx * source_size.x == sTex->GetWidth() &&
 				fy * source_size.y == sTex->GetHeight())
 			{
-				FilteredDownsampleTexture(sTex, nTex, static_cast<u32>(fx), GSVector2i(0, 0),
+				FilteredDownsampleTexture(sTex, m_shader_chain_source, static_cast<u32>(fx), GSVector2i(0, 0),
 					GSVector4(0, 0, source_size.x, source_size.y));
 			}
 			else
 			{
-				StretchRect(sTex, nTex, ShaderConvert::COPY, Filter::Biln);
+				StretchRect(sTex, m_shader_chain_source, ShaderConvert::COPY, Filter::Biln);
 			}
-			sTex = nTex;
+			sTex = m_shader_chain_source;
 		}
 	}
+	else if (m_shader_chain_source)
+	{
+		// Dropped back to 1x (or the caller stopped asking): the native-size copy is dead weight.
+		delete m_shader_chain_source;
+		m_shader_chain_source = nullptr;
+	}
 
-	// Same ping-pong as FXAA: the chain reads its source, so it can't also write it — key the
-	// target off sTex (the possibly-downscaled source) rather than m_current, which also means
-	// m_current is left untouched until the chain actually succeeds. Unlike FXAA the target is
-	// sized to the caller's on-screen rect, not to the source — see the header for why that has
-	// to be the aspect-corrected rect and not the window.
-	GSTexture*& dTex = (sTex == m_target_tmp) ? m_merge : m_target_tmp;
-	if (!ResizeRenderTarget(&dTex, output_size.x, output_size.y, false, false))
+	// The chain reads its source, so it can't also write it: the target is its own texture,
+	// which also leaves m_current untouched until the chain actually succeeds. Unlike FXAA the
+	// target is sized to the caller's on-screen rect, not to the source — see the header for
+	// why that has to be the aspect-corrected rect and not the window. Steady state this is a
+	// size compare and nothing else.
+	if (!ResizeRenderTarget(&m_shader_chain_target, output_size.x, output_size.y, false, false))
 		return false;
 
 	// Only swap on success — a failed chain (bad preset, unsupported backend) must leave
 	// m_current pointing at the unshaded frame rather than at a target nothing rendered to.
-	if (!DoApplyShaderChain(sTex, dTex))
+	// Consumed before the call and advanced whether or not the frame succeeds: a failed
+	// preset does not make the next presented frame's parity any different.
+	const size_t frame_count = m_shader_chain_frame_count++;
+	if (!DoApplyShaderChain(sTex, m_shader_chain_target, frame_count))
 		return false;
 
 	m_shader_chain_loaded = true;
-	m_current = dTex;
+	m_current = m_shader_chain_target;
 	return true;
 }
 

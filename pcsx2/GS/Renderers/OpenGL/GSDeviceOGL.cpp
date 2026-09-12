@@ -2887,7 +2887,6 @@ void GSDeviceOGL::DestroyShaderChain()
 #endif
 	m_shader_chain_preset.clear();
 	m_shader_chain_failed = false;
-	m_shader_frame_count = 0;
 	m_shader_param_generation = 0;
 }
 
@@ -2963,7 +2962,7 @@ void GSDeviceOGL::RestoreGLStateAfterShaderChain()
 	GLProgram::ResetLastProgram();
 }
 
-bool GSDeviceOGL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
+bool GSDeviceOGL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t frame_count)
 {
 #ifndef ARMSX2_HAS_LIBRASHADER
 	return false;
@@ -3013,7 +3012,6 @@ bool GSDeviceOGL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 		}
 
 		m_shader_chain = chain;
-		m_shader_frame_count = 0;
 		// The new chain sits at the preset's initial values, so whatever we last pushed is
 		// gone with the old one — force ApplyShaderChainParams to feed it again.
 		m_shader_param_generation = 0;
@@ -3043,7 +3041,7 @@ bool GSDeviceOGL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 	// Every librashader entry point takes the chain handle by address, not by value.
 	// Unlike Vulkan there's no command buffer — the chain issues its draws immediately.
 	libra_gl_filter_chain_t chain = static_cast<libra_gl_filter_chain_t>(m_shader_chain);
-	const libra_error_t err = libra_gl_filter_chain_frame(&chain, m_shader_frame_count, in, out, &vp, nullptr, nullptr);
+	const libra_error_t err = libra_gl_filter_chain_frame(&chain, frame_count, in, out, &vp, nullptr, nullptr);
 
 	// Unconditional: the chain can fail part-way through, having already clobbered state.
 	RestoreGLStateAfterShaderChain();
@@ -3054,7 +3052,6 @@ bool GSDeviceOGL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex)
 		m_shader_chain_failed = true;
 		return false;
 	}
-	m_shader_frame_count++;
 
 	dst->SetState(GSTexture::State::Dirty);
 	return true;
