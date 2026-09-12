@@ -529,6 +529,10 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 #endif
 
 	m_optional_extensions.vk_ext_fragment_shader_interlock = SupportsExtension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, false);
+	// Consumed by the RetroArch shader chain only: in render-pass mode librashader creates and
+	// later destroys one VkFramebuffer per pass per frame (18 for a big CRT preset). The GS's own
+	// passes keep using render pass objects.
+	m_optional_extensions.vk_khr_dynamic_rendering = SupportsExtension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, false);
 
 	return true;
 }
@@ -718,6 +722,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
 	VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fragment_shader_interlock_ext_feature = {
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+	VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic_rendering_feature = {
+		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
 
 	// An advertised EXTENSION does not guarantee its FEATURE bit, and asking for a feature the
 	// driver does not have fails vkCreateDevice outright with VK_ERROR_FEATURE_NOT_PRESENT —
@@ -743,6 +749,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
 		VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT probe_fsi = {
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+		VkPhysicalDeviceDynamicRenderingFeaturesKHR probe_dr = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
 
 		// Only chain what we would actually enable: querying a struct whose extension is absent is
 		// not something the spec promises anything about.
@@ -759,6 +767,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			Vulkan::AddPointerToChain(&probe, &probe_sm1);
 		if (m_optional_extensions.vk_ext_fragment_shader_interlock)
 			Vulkan::AddPointerToChain(&probe, &probe_fsi);
+		if (m_optional_extensions.vk_khr_dynamic_rendering)
+			Vulkan::AddPointerToChain(&probe, &probe_dr);
 		vkGetPhysicalDeviceFeatures2(m_physical_device, &probe);
 
 		// Returns the flag rather than taking it by reference: m_optional_extensions members are
@@ -792,6 +802,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		m_optional_extensions.vk_ext_fragment_shader_interlock = keep("VK_EXT_fragment_shader_interlock",
 			m_optional_extensions.vk_ext_fragment_shader_interlock,
 			probe_fsi.fragmentShaderPixelInterlock == VK_TRUE);
+		m_optional_extensions.vk_khr_dynamic_rendering = keep("VK_KHR_dynamic_rendering",
+			m_optional_extensions.vk_khr_dynamic_rendering, probe_dr.dynamicRendering == VK_TRUE);
 
 		// Depth ROAA is an optional sub-feature: a driver can offer the extension and colour
 		// access yet not depth.
@@ -831,6 +843,12 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	{
 		fragment_shader_interlock_ext_feature.fragmentShaderPixelInterlock = VK_TRUE;
 		Vulkan::AddPointerToChain(&device_info, &fragment_shader_interlock_ext_feature);
+	}
+
+	if (m_optional_extensions.vk_khr_dynamic_rendering)
+	{
+		dynamic_rendering_feature.dynamicRendering = VK_TRUE;
+		Vulkan::AddPointerToChain(&device_info, &dynamic_rendering_feature);
 	}
 
 	VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
@@ -4837,8 +4855,20 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t fra
 
 		// create() invalidates `preset` unconditionally ("the shader preset is
 		// immediately invalidated"), so it must NOT be freed afterwards on either path.
+		filter_chain_vk_opt_t opt = {};
+		opt.version = LIBRASHADER_CURRENT_VERSION;
+		opt.frames_in_flight = 0; // default (3) — the same depth as NUM_COMMAND_BUFFERS.
+		opt.force_no_mipmaps = false;
+		// Render-pass mode creates and later destroys a VkFramebuffer per pass per frame; dynamic
+		// rendering has none. librashader resolves the CORE vkCmdBeginRendering name through
+		// vkGetDeviceProcAddr and quietly falls back to render passes when that is null, so make
+		// the same check here and say in the log which path the device actually took.
+		opt.use_dynamic_rendering = m_optional_extensions.vk_khr_dynamic_rendering &&
+			vkGetDeviceProcAddr(m_device, "vkCmdBeginRendering") != nullptr;
+		opt.disable_cache = false;
+
 		libra_vk_filter_chain_t chain = nullptr;
-		if (libra_error_t err = libra_vk_filter_chain_create(&preset, vk, nullptr, &chain))
+		if (libra_error_t err = libra_vk_filter_chain_create(&preset, vk, &opt, &chain))
 		{
 			ReportShaderChainError("chain create", err);
 			m_shader_chain_failed = true;
@@ -4849,7 +4879,8 @@ bool GSDeviceVK::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t fra
 		// The new chain sits at the preset's initial values, so whatever we last pushed is
 		// gone with the old one — force ApplyShaderChainParams to feed it again.
 		m_shader_param_generation = 0;
-		Console.WriteLn("(GS) librashader: loaded preset '%s'", m_shader_chain_preset.c_str());
+		Console.WriteLn("(GS) librashader: loaded preset '%s' (dynamic rendering %s)",
+			m_shader_chain_preset.c_str(), opt.use_dynamic_rendering ? "on" : "off");
 	}
 
 	// GS thread, chain alive, before the frame call — the only place a set_param is safe.
