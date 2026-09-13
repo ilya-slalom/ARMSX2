@@ -461,6 +461,8 @@ bool GSDeviceOGL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 			const char* name = shader.EntryPoint();
 
 			std::string macro;
+			macro += fmt::format("#define PRIMID_MAX {}\n", GSShader::PRIMID_MAX);
+			macro += fmt::format("#define PRIMID_MIN {}\n", GSShader::PRIMID_MIN);
 			macro += fmt::format("#define HAS_BILN {}\n", static_cast<int>(shader.Biln()));
 			macro += fmt::format("#define HAS_STENCIL_OUTPUT {}\n", static_cast<int>(shader.StencilOutput()));
 			macro += fmt::format("#define HAS_INTEGER_OUTPUT {}\n", static_cast<int>(shader.IntegerOutputBpp() != 0));
@@ -651,9 +653,13 @@ bool GSDeviceOGL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 
 		for (size_t i = 0; i < std::size(m_date.primid_ps); i++)
 		{
+			std::string macro;
+			macro += fmt::format("#define PRIMID_MAX {}\n", GSShader::PRIMID_MAX);
+			macro += fmt::format("#define PRIMID_MIN {}\n", GSShader::PRIMID_MIN);
+
 			const std::string ps(GetShaderSource(
 				fmt::format("ps_primid_image_init_{}", i),
-				GL_FRAGMENT_SHADER, *convert_glsl));
+				GL_FRAGMENT_SHADER, *convert_glsl, macro));
 			m_shader_cache.GetProgram(&m_date.primid_ps[i], m_convert.vs, ps);
 			m_date.primid_ps[i].SetFormattedName("PrimID Destination Alpha Init %d", i);
 		}
@@ -1139,6 +1145,15 @@ bool GSDeviceOGL::CheckFeatures()
 	m_features.dxt_textures = GLAD_GL_EXT_texture_compression_s3tc;
 	m_features.bptc_textures =
 		GLAD_GL_VERSION_4_2 || GLAD_GL_ARB_texture_compression_bptc || GLAD_GL_EXT_texture_compression_bptc;
+	// ASTC LDR from the live context. GL_KHR_texture_compression_astc_hdr is a superset of
+	// the LDR profiles, so accepting its 2D-LDR portion here is correct; the desktop-GL
+	// extensions are accepted too but no shipping desktop driver needs them.
+	m_features.astc_textures = m_is_gles
+		? (GLAD_GL_ES_VERSION_3_2 || GLAD_GL_OES_texture_compression_astc ||
+			  GLAD_GL_KHR_texture_compression_astc_ldr || GLAD_GL_KHR_texture_compression_astc_hdr)
+		: (GLAD_GL_KHR_texture_compression_astc_ldr || GLAD_GL_KHR_texture_compression_astc_hdr);
+	DevCon.WriteLn("GL: ASTC LDR texture replacements %s.",
+		m_features.astc_textures ? "active" : "not supported by this context");
 	m_features.prefer_new_textures = false;
 	m_features.stencil_buffer = true;
 	m_features.test_and_sample_depth = true;
@@ -1513,7 +1528,9 @@ GSDevice::PresentResult GSDeviceOGL::DoBeginPresent(bool frame_skip)
 	if (m_gpu_pipeline_statistics_enabled)
 		PopPipelineStatisticsQuery();
 
-	OMSetFBO(0);
+	// Not necessarily zero: a libretro frontend hands the core its own FBO to
+	// draw the finished frame into.
+	OMSetFBO(m_gl_context->GetDefaultFramebuffer());
 	OMSetColorMaskState();
 
 	// On TBDR, hint that the default framebuffer's prior content is throwaway
@@ -2274,6 +2291,15 @@ std::string GSDeviceOGL::GetVSSource(VSSelector sel)
 
 std::string GSDeviceOGL::GetPSSource(const PSSelector& sel)
 {
+	// af_in_src1 reroutes a fixed (AFIX) blend factor through the second fragment output, for a
+	// driver whose blend constant is broken. Only the Vulkan shader implements it, and only
+	// GSDeviceVK raises features.broken_blend_constant, so nothing reaches this today. If a
+	// driver-database entry ever does, the blend state moves to SRC1 factors while this shader
+	// keeps writing As, which is wrong colour and nothing else would say so.
+	if (sel.af_in_src1)
+		Console.Error("PS_AF_IN_SRC1 is not implemented in this backend's shader.");
+	pxAssert(!sel.af_in_src1);
+
 	DevCon.WriteLn("GL: Compiling new pixel shader with selector 0x%016" PRIX64 "_%016" PRIX64, sel.key_hi, sel.key_lo);
 
 	std::string macro = fmt::format("#define PS_FST {}\n", sel.fst)
@@ -2318,6 +2344,8 @@ std::string GSDeviceOGL::GetPSSource(const PSSelector& sel)
 		+ fmt::format("#define PS_READ16_SRC {}\n", sel.real16src)
 		+ fmt::format("#define PS_WRITE_RG {}\n", sel.write_rg)
 		+ fmt::format("#define PS_FBMASK {}\n", sel.fbmask)
+		+ fmt::format("#define PS_QUANTIZE_COLOR {}\n", sel.quantize_color)
+		+ fmt::format("#define PS_SUBSTITUTE_ALPHA {}\n", sel.substitute_alpha)
 		+ fmt::format("#define PS_COLCLIP_HW {}\n", sel.colclip_hw)
 		+ fmt::format("#define PS_RTA_CORRECTION {}\n", sel.rta_correction)
 		+ fmt::format("#define PS_RTA_SRC_CORRECTION {}\n", sel.rta_source_correction)
@@ -3435,7 +3463,7 @@ void GSDeviceOGL::RenderImGui()
 
 void GSDeviceOGL::RenderBlankFrame()
 {
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_gl_context->GetDefaultFramebuffer());
 	glDisable(GL_SCISSOR_TEST);
 	if (m_is_gles) // GLES/TBDR-only tile-bandwidth hint; inert on desktop, gated to keep it canonical
 	{

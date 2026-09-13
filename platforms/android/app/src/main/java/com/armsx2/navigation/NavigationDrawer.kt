@@ -193,6 +193,9 @@ private fun DrawerContent(selected: AppRoute, onNavigate: (AppRoute) -> Unit, on
         // Boot straight into the PS2 system BIOS with no disc — distinct from "BIOS Location"
         // below, which only points the emulator at your BIOS file.
         DrawerItem("bios.boot.title", "▶️", onAction = { MainActivityRuntime.startBios(); onDismiss() }),
+        // Pick a file and run it, without it joining the library. Sits next to Boot BIOS because
+        // both are "start something that is not a library entry".
+        DrawerItem("action.launchGame", "📂", onAction = { MainActivityRuntime.promptLaunchGame(); onDismiss() }),
         DrawerItem("ra.title", "🏆", AppRoute.Achievements, iconRes = com.armsx2.R.drawable.ic_trophy,
             iconTint = TrophyGold),
         DrawerItem("action.settings", "⚙️", AppRoute.Settings()),
@@ -203,7 +206,7 @@ private fun DrawerContent(selected: AppRoute, onNavigate: (AppRoute) -> Unit, on
         DrawerItem("games.overflow.setup", "📂",
             onAction = { MainActivityRuntime.reopenSetup(); onDismiss() }),
         DrawerItem("setup.step.bios.title", "📀", AppRoute.BiosManager()),
-        DrawerItem("memcard.title", "💾", AppRoute.MemoryCardManager),
+        DrawerItem("memcard.title", "💾", AppRoute.MemoryCardManager()),
         DrawerItem("savestate.title.loadManage", "📥", AppRoute.SaveManager),
         DrawerItem("tab.controls", "🕹️", AppRoute.ControllerManager),
         DrawerItem("patches.dialog.patchesAndCheats", "🪄", AppRoute.PatchManager),
@@ -282,7 +285,12 @@ private fun DrawerSection(
     )
     items.forEachIndexed { index, item ->
         DrawerRow(
-            controllerId = "drawer.${item.destination?.let { it::class.simpleName } ?: item.titleKey}",
+            // Keyed by titleKey, NOT by the destination class: SettingsControllerNav keys both
+            // register() and setPosition() by this id, so two rows sharing one id collapse into a
+            // single entry at whichever row composed last -- and the other becomes unreachable by
+            // controller while still clickable by touch. Every row here happens to carry a distinct
+            // destination today, but that is luck; titleKeys are unique by construction.
+            controllerId = "drawer.${item.titleKey}",
             title = str(item.titleKey),
             glyph = item.glyph,
             iconRes = item.iconRes,
@@ -346,7 +354,7 @@ private fun sameDestination(current: AppRoute, target: AppRoute): Boolean = when
     AppRoute.Home -> current is AppRoute.Home
     is AppRoute.Settings -> current is AppRoute.Settings
     is AppRoute.BiosManager -> current is AppRoute.BiosManager
-    AppRoute.MemoryCardManager -> current is AppRoute.MemoryCardManager
+    is AppRoute.MemoryCardManager -> current is AppRoute.MemoryCardManager
     AppRoute.SaveManager -> current is AppRoute.SaveManager
     AppRoute.ControllerManager -> current is AppRoute.ControllerManager
     AppRoute.PatchManager -> current is AppRoute.PatchManager

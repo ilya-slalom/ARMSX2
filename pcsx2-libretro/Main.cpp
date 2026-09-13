@@ -36,7 +36,16 @@
 
 #include "libretro.h"
 
-#define VK_NO_PROTOTYPES
+// libretro_vulkan.h pulls in vulkan.h, which only declares a platform's surface
+// types when that platform's VK_USE_PLATFORM_* macro is already defined. The
+// header guard then locks the result in, so whichever of the two headers lands
+// first decides what the whole translation unit gets: include libretro_vulkan.h
+// first and the Metal, Xlib and Wayland sections are skipped for good, and
+// VKEntryPoints.inl loses PFN_vkCreateMetalSurfaceEXT / the Xlib and Wayland
+// entry points with it. VKLoader.h is the header that sets all five platform
+// macros (and cleans up the Xlib ones afterwards), so it has to come first.
+#include "pcsx2/GS/Renderers/Vulkan/VKLoader.h"
+
 #include "libretro_vulkan.h"
 
 #include "fmt/format.h"
@@ -52,6 +61,7 @@
 #include "common/SmallString.h"
 #include "common/StringUtil.h"
 #include "common/Threading.h"
+#include "common/HostVFS.h"
 
 #include "pcsx2/PrecompiledHeader.h"
 
@@ -60,6 +70,9 @@
 #include "pcsx2/GS.h"
 #include "pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h"
 #include "pcsx2/GS/Renderers/Vulkan/VKLibretro.h"
+#ifdef ENABLE_OPENGL
+#include "pcsx2/GS/Renderers/OpenGL/GLContextLibretro.h"
+#endif
 #include "pcsx2/GameList.h"
 #include "pcsx2/Host.h"
 #include "pcsx2/INISettingsInterface.h"
@@ -91,6 +104,7 @@ static retro_audio_sample_batch_t audio_batch_cb;
 static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
 static retro_log_printf_t log_cb;
+static retro_set_rumble_state_t rumble_cb;
 
 namespace LibretroCore
 {
@@ -112,6 +126,11 @@ namespace LibretroCore
 	// which opens MTGS/GSDeviceVK from the frontend thread) and (b) fired
 	// context_reset (making the retro_hw_render_interface_vulkan available).
 	static bool s_hw_render_vulkan = false;
+	// The GL alternative to it. No device negotiation to wait on here - the
+	// frontend makes a context current and fires context_reset - but the boot
+	// has to park on that reset all the same, since GSDeviceOGL cannot open
+	// before there is a context to open against.
+	static bool s_hw_render_gl = false;
 	static std::atomic<bool> s_cpu_thread_initialized{false};
 	static std::atomic<bool> s_context_ready{false};
 } // namespace LibretroCore
@@ -341,6 +360,37 @@ void Host::SetMouseLock(bool state)
 {
 }
 
+void Host::SetPadVibration(u32 pad_index, float large_or_single_motor_intensity, float small_motor_intensity)
+{
+	if (!rumble_cb)
+		return;
+
+	// Deduped because the pad re-sends its vibration state on every poll the game
+	// makes, not only when it changes, and set_rumble_state reaches the frontend's
+	// input driver. InputManager cannot do this for us: its own dedup lives in the
+	// per-motor bindings, and the core has none of those.
+	static float s_last[Pad::NUM_CONTROLLER_PORTS][2] = {};
+	if (s_last[pad_index][0] == large_or_single_motor_intensity &&
+		s_last[pad_index][1] == small_motor_intensity)
+	{
+		return;
+	}
+
+	s_last[pad_index][0] = large_or_single_motor_intensity;
+	s_last[pad_index][1] = small_motor_intensity;
+
+	// Clamped rather than trusted: the scale is the full u16 range, so a stray
+	// intensity above 1 would wrap to a near-zero strength instead of saturating.
+	const auto to_strength = [](float intensity) -> u16 {
+		return static_cast<u16>(std::clamp(intensity, 0.0f, 1.0f) * 65535.0f + 0.5f);
+	};
+
+	// STRONG is the large (low-frequency) motor, WEAK the small one - the same
+	// order this function takes them in.
+	rumble_cb(pad_index, RETRO_RUMBLE_STRONG, to_strength(large_or_single_motor_intensity));
+	rumble_cb(pad_index, RETRO_RUMBLE_WEAK, to_strength(small_motor_intensity));
+}
+
 std::optional<WindowInfo> Host::AcquireRenderWindow(bool recreate_window)
 {
 	return BuildLibretroWindowInfo();
@@ -476,14 +526,6 @@ bool Host::IsFullscreen()
 }
 
 void Host::SetFullscreen(bool enabled)
-{
-}
-
-void Host::OnCaptureStarted(const std::string& filename)
-{
-}
-
-void Host::OnCaptureStopped()
 {
 }
 
@@ -629,7 +671,7 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
 	// With Vulkan HW render the boot has to wait for the frontend's context
 	// negotiation + context_reset; booting earlier would open MTGS before
 	// VKLibretro::Init holds the shared instance.
-	while (s_hw_render_vulkan && !s_context_ready.load(std::memory_order_acquire) &&
+	while ((s_hw_render_vulkan || s_hw_render_gl) && !s_context_ready.load(std::memory_order_acquire) &&
 			!s_shutdown_requested.load(std::memory_order_acquire))
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
@@ -668,11 +710,15 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
 					VMBootParameters bp = std::move(pending_boot.value());
 					pending_boot.reset();
 					std::fprintf(stderr, "[libretro] CPU thread: VMManager::Initialize...\n");
-					const VMBootResult br = VMManager::Initialize(bp);
+					// With the error in hand the log says which file could not be
+					// opened; without it a failed boot is a bare result code.
+					Error boot_error;
+					const VMBootResult br = VMManager::Initialize(bp, &boot_error);
 					std::fprintf(stderr, "[libretro] CPU thread: Initialize -> %d\n", (int)br);
 					if (br != VMBootResult::StartupSuccess)
 					{
-						Console.ErrorFmt("VMManager::Initialize failed (result {}).", static_cast<int>(br));
+						Console.ErrorFmt("VMManager::Initialize failed (result {}): {}",
+							static_cast<int>(br), boot_error.GetDescription());
 						s_shutdown_requested.store(true, std::memory_order_release);
 						break;
 					}
@@ -801,6 +847,26 @@ static void RegisterDiskControl(void)
 	environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE, (void*)&cb);
 }
 
+// Join a playlist entry to the directory the playlist came from.
+//
+// Not Path::Combine(): it collapses repeated separators, which turns the "//"
+// of a frontend URI - "saf://content:..." on Android - into a single slash and
+// leaves a path nothing can open. Nor is Path::IsAbsolute() any help there,
+// since such a path does not start with a separator. Anything with a scheme is
+// therefore joined by hand, and everything else keeps the old behaviour.
+static std::string JoinPlaylistEntry(const std::string& base, const std::string& entry)
+{
+	const std::string::size_type scheme = base.find("://");
+	if (scheme == std::string::npos || scheme == 0)
+		return Path::Combine(base, entry);
+
+	std::string ret = base;
+	if (!ret.empty() && ret.back() != '/')
+		ret.push_back('/');
+	ret.append(entry);
+	return ret;
+}
+
 // Parse an .m3u playlist into s_disk_images; returns the first disc path.
 static std::string LoadM3UPlaylist(const std::string& m3u_path)
 {
@@ -817,7 +883,7 @@ static std::string LoadM3UPlaylist(const std::string& m3u_path)
 		if (line.empty() || line[0] == '#')
 			continue;
 		if (!Path::IsAbsolute(line))
-			line = Path::Combine(base, line);
+			line = JoinPlaylistEntry(base, line);
 		s_disk_images.push_back(std::move(line));
 	}
 
@@ -840,9 +906,9 @@ static struct retro_core_option_v2_category kOptionCategories[] = {
 
 static struct retro_core_option_v2_definition kOptionDefinitions[] = {
 	{"armsx2_renderer", "GS Renderer (restart)", "GS Renderer (restart)",
-		"Vulkan renders the GS on the GPU. Software renders on the CPU and presents through the same shared Vulkan context.",
+		"Vulkan renders the GS on the GPU. OpenGL does the same through the frontend's GL context, for devices with no usable Vulkan driver. Software renders on the CPU and presents through the same shared context.",
 		nullptr, "video",
-		{{"Vulkan", nullptr}, {"Software", nullptr}, {nullptr, nullptr}}, "Vulkan"},
+		{{"Vulkan", nullptr}, {"OpenGL", nullptr}, {"Software", nullptr}, {nullptr, nullptr}}, "Vulkan"},
 	{"armsx2_upscale", "Internal Resolution", "Internal Resolution",
 		"Renders the PS2 output at a multiple of native resolution. The output canvas follows this size.",
 		nullptr, "video",
@@ -955,7 +1021,7 @@ static struct retro_core_options_v2 kOptionsV2 = {kOptionCategories, kOptionDefi
 // Legacy fallback: first value doubles as the default. Non-const so the
 // BIOS entry can be pointed at the scanned list.
 static struct retro_variable kCoreVariables[] = {
-	{"armsx2_renderer", "GS renderer (restart); Vulkan|Software"},
+	{"armsx2_renderer", "GS renderer (restart); Vulkan|OpenGL|Software"},
 	{"armsx2_upscale", "Internal resolution; 1x|2x|3x|4x"},
 	{"armsx2_aspect_ratio", "Aspect ratio; Auto 4:3/3:2|4:3|16:9|Stretch"},
 	{"armsx2_deinterlacing", "Deinterlacing; Automatic|Off|Weave TFF|Weave BFF|Bob TFF|Bob BFF|Blend TFF|Blend BFF|Adaptive TFF|Adaptive BFF"},
@@ -1055,6 +1121,10 @@ static void ApplyCoreOptions(bool startup)
 			// only honour this at startup.
 			if (!std::strcmp(var.value, "Software"))
 				s_base_settings->SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::SW));
+#ifdef ENABLE_OPENGL
+			else if (!std::strcmp(var.value, "OpenGL"))
+				s_base_settings->SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::OGL));
+#endif
 		}
 
 		var = {"armsx2_upscale", nullptr};
@@ -1312,6 +1382,55 @@ static bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instanc
 	return true;
 }
 
+// The GL half of the same story. The frontend owns the context; the core only
+// needs its two callbacks - one to resolve entry points, one to ask which FBO
+// this frame belongs in - which GLContextLibretro hands to GSDeviceOGL.
+//
+// None of it exists where the GL renderer is not built: USE_OPENGL is not even
+// offered on Apple, where the GS is Metal and Vulkan.
+#ifdef ENABLE_OPENGL
+static struct retro_hw_render_callback s_gl_hw_render = {};
+
+static void* GLGetProcAddress(const char* name)
+{
+	return s_gl_hw_render.get_proc_address ?
+			   reinterpret_cast<void*>(s_gl_hw_render.get_proc_address(name)) :
+			   nullptr;
+}
+
+static u32 GLGetCurrentFramebuffer()
+{
+	return s_gl_hw_render.get_current_framebuffer ?
+			   static_cast<u32>(s_gl_hw_render.get_current_framebuffer()) :
+			   0;
+}
+
+static void OnGLContextReset(void)
+{
+	// The flavour goes with the callbacks: it is what GLContext::Create picks
+	// the desktop or the ES entry-point loader from, and what GSDeviceOGL asks
+	// before it decides which GL feature set it is allowed to use. It is the
+	// context type asked for in retro_load_game, since that is what the
+	// frontend has just made current.
+	const GLContext::Profile profile =
+		(s_gl_hw_render.context_type == RETRO_HW_CONTEXT_OPENGLES2 ||
+			s_gl_hw_render.context_type == RETRO_HW_CONTEXT_OPENGLES3 ||
+			s_gl_hw_render.context_type == RETRO_HW_CONTEXT_OPENGLES_VERSION) ?
+			GLContext::Profile::ES :
+			GLContext::Profile::Core;
+
+	GLContextLibretro::SetCallbacks(GLGetProcAddress, GLGetCurrentFramebuffer, profile,
+		static_cast<int>(s_gl_hw_render.version_major), static_cast<int>(s_gl_hw_render.version_minor));
+	LibretroCore::s_context_ready.store(true, std::memory_order_release);
+}
+
+static void OnGLContextDestroy(void)
+{
+	LibretroCore::s_context_ready.store(false, std::memory_order_release);
+	GLContextLibretro::SetCallbacks(nullptr, nullptr);
+}
+#endif // ENABLE_OPENGL
+
 static void OnContextReset(void)
 {
 	retro_hw_render_interface* iface = nullptr;
@@ -1342,6 +1461,93 @@ RETRO_API unsigned retro_api_version(void)
 	return RETRO_API_VERSION;
 }
 
+// Hand the frontend's file system to common/FileSystem. Without it the core
+// can only open paths the OS understands, which on Android leaves out
+// everything reached through the Storage Access Framework (content:// URIs)
+// and everything on a network share - which is to say most of a user's games.
+//
+// The interface itself, so the trampolines below can reach it: HostVFS::Ops
+// is typed in terms of void* handles, because common/ does not get to know
+// what libretro is, and casting the frontend's function pointers to that shape
+// would be undefined - the truncate one differs in return type, not just in
+// pointer types, and the compiler says so. Small forwarders instead.
+static retro_vfs_interface* s_vfs = nullptr;
+
+static void InstallFrontendVFS(retro_environment_t cb)
+{
+	// Descending, because the contract is all-or-nothing: "if the core asks
+	// for a newer VFS API version than the frontend supports, the frontend
+	// must return false". Asking only for 3 - where stat(), mkdir() and the
+	// directory iterator live - would mean a pre-v3 frontend hands back
+	// nothing at all rather than the file half, and the Android storage
+	// support this exists for is exactly what runs on those.
+	unsigned version = 0;
+	for (const unsigned wanted : {3u, 2u, 1u})
+	{
+		retro_vfs_interface_info info = {wanted, nullptr};
+		if (cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &info) && info.iface)
+		{
+			// What the frontend accepted, not what it claims to have. The loop
+			// above exists precisely because required_interface_version cannot
+			// be relied on to tell us; taking the larger of the two would wire
+			// up members on the strength of the same field, and only differs
+			// for a frontend that refuses 3 while reporting 3 - which is one
+			// contradicting itself, in the direction that crashes.
+			version = wanted;
+			s_vfs = info.iface;
+			break;
+		}
+	}
+
+	if (!s_vfs)
+		return;
+
+	HostVFS::Ops ops = {};
+	ops.open = [](const char* path, unsigned mode, unsigned hints) -> void* {
+		return s_vfs->open(path, mode, hints);
+	};
+	ops.close = [](void* handle) { return s_vfs->close(static_cast<retro_vfs_file_handle*>(handle)); };
+	ops.size = [](void* handle) -> s64 { return s_vfs->size(static_cast<retro_vfs_file_handle*>(handle)); };
+	ops.tell = [](void* handle) -> s64 { return s_vfs->tell(static_cast<retro_vfs_file_handle*>(handle)); };
+	ops.seek = [](void* handle, s64 offset, int whence) -> s64 {
+		return s_vfs->seek(static_cast<retro_vfs_file_handle*>(handle), offset, whence);
+	};
+	ops.read = [](void* handle, void* buffer, u64 length) -> s64 {
+		return s_vfs->read(static_cast<retro_vfs_file_handle*>(handle), buffer, length);
+	};
+	ops.write = [](void* handle, const void* buffer, u64 length) -> s64 {
+		return s_vfs->write(static_cast<retro_vfs_file_handle*>(handle), buffer, length);
+	};
+	ops.remove = s_vfs->remove;
+	ops.rename = s_vfs->rename;
+
+	// flush() and truncate() are deliberately not wired up: nothing in the
+	// tree asks for either through this path.
+
+	if (version >= 3)
+	{
+		ops.stat = s_vfs->stat;
+		ops.mkdir = s_vfs->mkdir;
+		ops.opendir = [](const char* dir, bool include_hidden) -> void* {
+			return s_vfs->opendir(dir, include_hidden);
+		};
+		ops.readdir = [](void* handle) { return s_vfs->readdir(static_cast<retro_vfs_dir_handle*>(handle)); };
+		ops.dirent_get_name = [](void* handle) {
+			return s_vfs->dirent_get_name(static_cast<retro_vfs_dir_handle*>(handle));
+		};
+		ops.dirent_is_dir = [](void* handle) { return s_vfs->dirent_is_dir(static_cast<retro_vfs_dir_handle*>(handle)); };
+		ops.closedir = [](void* handle) { return s_vfs->closedir(static_cast<retro_vfs_dir_handle*>(handle)); };
+	}
+
+	HostVFS::Install(ops);
+
+	if (log_cb)
+	{
+		log_cb(RETRO_LOG_INFO, "Using the frontend's VFS (interface version %u)%s\n", version,
+			(version >= 3) ? "" : " - files only, the OS answers for directories and stat()");
+	}
+}
+
 RETRO_API void retro_set_environment(retro_environment_t cb)
 {
 	environ_cb = cb;
@@ -1354,6 +1560,16 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
 
 	bool support_no_game = false;
 	cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &support_no_game);
+
+	InstallFrontendVFS(cb);
+
+	// The core binds no motors of its own - it turns the SDL input source off and
+	// takes pads from the frontend - so this is the only route to a vibrator. A
+	// frontend that answers still need not have a pad that can rumble; the call
+	// just returns false per port in that case, which is not worth reporting.
+	struct retro_rumble_interface rumble_iface = {};
+	if (cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble_iface))
+		rumble_cb = rumble_iface.set_rumble_state;
 
 	PopulateBiosOptions(cb);
 
@@ -1392,6 +1608,18 @@ RETRO_API void retro_set_input_state(retro_input_state_t cb)
 RETRO_API void retro_init(void)
 {
 	Log::SetConsoleOutputLevel(LOGLEVEL_INFO);
+	// Send warnings and errors to the frontend too: that is the only log an end
+	// user has. Without this, an emulator-side failure - a shader the GS could
+	// not read, a BIOS it did not like - reaches the console sink only, which
+	// is a terminal nobody has open, or logcat on Android. The RetroArch log
+	// then shows the symptom with no cause: "MTGS::WaitForOpen failed".
+	Log::SetHostOutputLevel(LOGLEVEL_WARNING, [](LOGLEVEL level, ConsoleColors, std::string_view message) {
+		if (!log_cb)
+			return;
+
+		log_cb(level <= LOGLEVEL_ERROR ? RETRO_LOG_ERROR : RETRO_LOG_WARN, "%.*s\n",
+			static_cast<int>(message.size()), message.data());
+	});
 	LibretroCore::s_frame_buffer.assign(
 		LibretroCore::kFrameWidth * LibretroCore::kFrameHeight, 0);
 }
@@ -1484,10 +1712,62 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
 
 	s_shutdown_requested.store(false, std::memory_order_release);
 
+	// Which hardware context to ask for. The renderer option is read into the
+	// settings above; GL takes a different path from here, since it needs no
+	// device negotiation - the frontend simply makes a context current and
+	// hands the core an FBO to draw into.
+#ifdef ENABLE_OPENGL
+	const bool want_gl = (s_base_settings->GetIntValue("EmuCore/GS", "Renderer",
+							  static_cast<int>(GSRendererType::VK)) == static_cast<int>(GSRendererType::OGL));
+#else
+	const bool want_gl = false;
+#endif
+
+	LibretroCore::s_hw_render_gl = want_gl;
+#ifdef ENABLE_OPENGL
+	if (want_gl)
+	{
+		s_gl_hw_render = {};
+#if defined(__ANDROID__)
+		// The only context type an Android frontend can give us.
+		s_gl_hw_render.context_type = RETRO_HW_CONTEXT_OPENGLES3;
+		s_gl_hw_render.version_major = 3;
+		s_gl_hw_render.version_minor = 2;
+#else
+		// GSDeviceOGL needs 3.3 at the very least, and uses 4.3/4.5 paths when
+		// the driver has them.
+		s_gl_hw_render.context_type = RETRO_HW_CONTEXT_OPENGL_CORE;
+		s_gl_hw_render.version_major = 3;
+		s_gl_hw_render.version_minor = 3;
+#endif
+		s_gl_hw_render.context_reset = OnGLContextReset;
+		s_gl_hw_render.context_destroy = OnGLContextDestroy;
+		s_gl_hw_render.depth = false;
+		s_gl_hw_render.bottom_left_origin = true;
+		s_gl_hw_render.cache_context = true;
+
+		// The GS runs on its own thread, so the frontend has to create the
+		// context in a way that lets a second thread use it. Without this the
+		// GL calls MTGS makes would land on a context that is current
+		// somewhere else.
+		bool shared_context = true;
+		if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT, &shared_context))
+			log_cb(RETRO_LOG_WARN, "Frontend has no shared GL context; the GS thread may not be able to draw.\n");
+
+		if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &s_gl_hw_render))
+		{
+			log_cb(RETRO_LOG_ERROR, "Frontend refused a GL context; falling back to Null GS.\n");
+			LibretroCore::s_hw_render_gl = false;
+			auto lock = Host::GetSettingsLock();
+			s_base_settings->SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::Null));
+			VMManager::Internal::LoadStartupSettings();
+		}
+	}
+#endif // ENABLE_OPENGL
 	// Vulkan HW render. The negotiation interface must be registered inside
 	// retro_load_game; the frontend invokes it while creating its Vulkan
 	// context, after this returns.
-	LibretroCore::s_hw_render_vulkan = true;
+	LibretroCore::s_hw_render_vulkan = !want_gl;
 	if (LibretroCore::s_hw_render_vulkan)
 	{
 		static struct retro_hw_render_callback hw_render = {};
@@ -1638,6 +1918,14 @@ RETRO_API void retro_run(void)
 
 	if (LibretroCore::s_hw_render_vulkan)
 	{
+		// A frontend reads the picture size from this callback on every frame,
+		// duplicates included, and RetroArch computes its integer scaling from
+		// that number rather than from the geometry the core announces. So a
+		// duplicate must not report a different size than the frame it repeats:
+		// the size the last real frame went out at is carried here for it.
+		static u32 last_frame_width = LibretroCore::kFrameWidth;
+		static u32 last_frame_height = LibretroCore::kFrameHeight;
+
 		// M2: consume the newest GS frame (if any) and hand it to the
 		// frontend. The retro_vulkan_image storage must outlive this call --
 		// the frontend keeps the pointer for cached-frame replays.
@@ -1674,12 +1962,23 @@ RETRO_API void retro_run(void)
 					VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
 				{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
 			vulkan->set_image(vulkan->handle, &vkimage, 0, nullptr, vulkan->queue_index);
+			last_frame_width = frame.width;
+			last_frame_height = frame.height;
 			video_cb(RETRO_HW_FRAME_BUFFER_VALID, frame.width, frame.height, 0);
 		}
 		else
 		{
-			video_cb(nullptr, LibretroCore::kFrameWidth, LibretroCore::kFrameHeight, 0);
+			video_cb(nullptr, last_frame_width, last_frame_height, 0);
 		}
+	}
+	else if (LibretroCore::s_hw_render_gl)
+	{
+		// GL needs no frame handover of its own: GSDeviceOGL has already drawn
+		// into the FBO the frontend named through get_current_framebuffer, so
+		// the frame is where the frontend expects it. The canvas is the fixed
+		// surface BuildLibretroWindowInfo reports, not the aspect-expanded one
+		// the Vulkan path resizes to.
+		video_cb(RETRO_HW_FRAME_BUFFER_VALID, LibretroCore::kFrameWidth, LibretroCore::kFrameHeight, 0);
 	}
 	else
 	{

@@ -642,6 +642,22 @@ static constexpr MTLPixelFormat ConvertPixelFormat(GSTexture::Format format)
 		case GSTexture::Format::BC2:          return MTLPixelFormatBC2_RGBA;
 		case GSTexture::Format::BC3:          return MTLPixelFormatBC3_RGBA;
 		case GSTexture::Format::BC7:          return MTLPixelFormatBC7_RGBAUnorm;
+			// Metal ASTC is optional and unimplemented; the replacement loader rejects ASTC
+			// before anything can ask for a pixel format. Keep the switch exhaustive.
+		case GSTexture::Format::ASTC4x4:
+		case GSTexture::Format::ASTC5x4:
+		case GSTexture::Format::ASTC5x5:
+		case GSTexture::Format::ASTC6x5:
+		case GSTexture::Format::ASTC6x6:
+		case GSTexture::Format::ASTC8x5:
+		case GSTexture::Format::ASTC8x6:
+		case GSTexture::Format::ASTC8x8:
+		case GSTexture::Format::ASTC10x5:
+		case GSTexture::Format::ASTC10x6:
+		case GSTexture::Format::ASTC10x8:
+		case GSTexture::Format::ASTC10x10:
+		case GSTexture::Format::ASTC12x10:
+		case GSTexture::Format::ASTC12x12:    return MTLPixelFormatInvalid;
 	}
 }
 
@@ -760,6 +776,11 @@ void GSDeviceMTL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
 
 	if (feedback_write_1) // FIXME I'm not sure dRect[0] is always correct
 		StretchRect(dTex, full_r, sTex[2], dRect[0], ShaderConvert::YUV, filter);
+
+	// With both circuits off nothing was drawn, so the clear above is the whole frame and it is
+	// still only deferred. Everyone downstream binds the native texture, and none of them can
+	// commit a clear, so do it here while a pass can still be opened.
+	FlushClears(dTex);
 }}
 
 void GSDeviceMTL::DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, ShaderInterlace shader, Filter filter, const InterlaceConstantBuffer& cb)
@@ -1367,9 +1388,10 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 
 	// Init metal stuff
 	m_fn_constants = MRCTransfer([MTLFunctionConstantValues new]);
-	setFnConstantB(m_fn_constants, m_features.framebuffer_fetch,    GSMTLConstantIndex_FRAMEBUFFER_FETCH);
-	setFnConstantB(m_fn_constants, m_features.depth_feedback,       GSMTLConstantIndex_DEPTH_FEEDBACK);
-	setFnConstantB(m_fn_constants, m_dev.features.rov_requires_r32, GSMTLConstantIndex_ROV_NEEDS_R32);
+	setFnConstantB(m_fn_constants, m_features.framebuffer_fetch,       GSMTLConstantIndex_FRAMEBUFFER_FETCH);
+	setFnConstantB(m_fn_constants, m_features.depth_feedback,          GSMTLConstantIndex_DEPTH_FEEDBACK);
+	setFnConstantB(m_fn_constants, m_dev.features.rov_requires_r32,    GSMTLConstantIndex_ROV_NEEDS_R32);
+	setFnConstantB(m_fn_constants, m_dev.features.broken_shader_depth, GSMTLConstantIndex_BROKEN_SHADER_DEPTH);
 
 	m_draw_sync_fence = MRCTransfer([m_dev.dev newFence]);
 	[m_draw_sync_fence setLabel:@"Draw Sync Fence"];
@@ -2114,6 +2136,9 @@ void GSDeviceMTL::PresentRect(GSTexture* sTex, const GSVector4& sRect, GSTexture
 	else
 	{
 		// !dTex → Use current draw encoder
+		// This pass is already open, so a clear still pending on the source can no longer be
+		// committed here. Whoever produced sTex owes us the flush.
+		pxAssertMsg(sTex->GetState() != GSTexture::State::Cleared, "Presented texture still has a pending clear");
 		[m_current_render.encoder setRenderPipelineState:pipe];
 		[m_current_render.encoder setFragmentSamplerState:m_sampler_hw[filter == Biln ? SamplerSelector::Linear().key : SamplerSelector::Point().key] atIndex:0];
 		[m_current_render.encoder setFragmentTexture:static_cast<GSTextureMTL*>(sTex)->GetTexture() atIndex:0];
@@ -2335,6 +2360,15 @@ void GSDeviceMTL::MRESetHWPipelineState(GSHWDrawConfig::VSSelector vssel, GSHWDr
 	}
 	else
 	{
+		// af_in_src1 reroutes a fixed (AFIX) blend factor through the second fragment output, for a
+		// driver whose blend constant is broken. Only the Vulkan shader implements it, and only
+		// GSDeviceVK raises features.broken_blend_constant, so nothing reaches this today. If a
+		// driver-database entry ever does, the blend state moves to SRC1 factors while this shader
+		// keeps writing As, which is wrong colour and nothing else would say so.
+		if (pssel.af_in_src1)
+			Console.Error("PS_AF_IN_SRC1 is not implemented in this backend's shader.");
+		pxAssert(!pssel.af_in_src1);
+
 		setFnConstantB(m_fn_constants, pssel.fst,                   GSMTLConstantIndex_FST);
 		setFnConstantB(m_fn_constants, pssel.iip,                   GSMTLConstantIndex_IIP);
 		setFnConstantI(m_fn_constants, pssel.aem_fmt,               GSMTLConstantIndex_PS_AEM_FMT);
@@ -2363,6 +2397,8 @@ void GSDeviceMTL::MRESetHWPipelineState(GSHWDrawConfig::VSSelector vssel, GSHWDr
 		setFnConstantB(m_fn_constants, pssel.real16src,             GSMTLConstantIndex_PS_READ16_SRC);
 		setFnConstantB(m_fn_constants, pssel.write_rg,              GSMTLConstantIndex_PS_WRITE_RG);
 		setFnConstantB(m_fn_constants, pssel.fbmask,                GSMTLConstantIndex_PS_FBMASK);
+		setFnConstantB(m_fn_constants, pssel.quantize_color,        GSMTLConstantIndex_PS_QUANTIZE_COLOR);
+		setFnConstantB(m_fn_constants, pssel.substitute_alpha,      GSMTLConstantIndex_PS_SUBSTITUTE_ALPHA);
 		setFnConstantI(m_fn_constants, pssel.blend_a,               GSMTLConstantIndex_PS_BLEND_A);
 		setFnConstantI(m_fn_constants, pssel.blend_b,               GSMTLConstantIndex_PS_BLEND_B);
 		setFnConstantI(m_fn_constants, pssel.blend_c,               GSMTLConstantIndex_PS_BLEND_C);
@@ -2692,6 +2728,9 @@ void GSDeviceMTL::DoRenderHW(GSHWDrawConfig& config)
 { @autoreleasepool {
 	if (config.tex && (config.ds == config.tex || config.rt == config.tex))
 		EndRenderPass(); // Barrier
+
+	if (m_dev.features.broken_shader_depth && (config.depth.ztst >= ZTST_GEQUAL || config.depth.zwe))
+		config.ps.zfloor = true; // Depth must always go through shader (see tfx vs for comment with details)
 
 	size_t vertsize = config.nverts * sizeof(*config.verts);
 	size_t idxsize = config.vs.UseFixedExpandIndexBuffer() ? 0 : (config.nindices * sizeof(*config.indices));
