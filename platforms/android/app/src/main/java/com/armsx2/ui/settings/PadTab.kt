@@ -42,6 +42,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.nativeKeyCode
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -297,6 +298,88 @@ fun PadTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
                 refreshToken.intValue++
             }
             SettingsDivider()
+            // Which physical controller is which player, and where its rumble goes.
+            //
+            // Slots are otherwise claimed first-to-press, which cannot express "the DualSense is
+            // player 1 and the built-in pad is player 2" -- and on a handheld the built-in pad is
+            // usually whatever presses something first. Pins are stored per controller (by
+            // descriptor, so they survive reconnects) and set once, rather than raced for at the
+            // start of every session.
+            val pads = remember(refreshToken.intValue) { com.armsx2.input.PadRouter.connectedPads() }
+            if (pads.isNotEmpty()) {
+                HelpText(str("pad.assign.help"))
+                // Only the slots Multitap actually arms. Offering player 3-8 with Multitap off
+                // would let the user pin a pad at an un-armed PS2 port, where its input goes
+                // nowhere at all -- the router ignores such a pin, so the picker must not show it.
+                val slotCount =
+                    if (ControllerMappings.multitapEnabled()) com.armsx2.input.PadRouter.MAX_PADS else 2
+                val slotLabels = listOf(str("pad.assign.auto")) +
+                    (0 until slotCount).map { str("pad.player${it + 1}") }
+                val rumbleModes = com.armsx2.input.PadRouter.RumbleMode.entries
+                val rumbleLabels = listOf(
+                    str("pad.assign.auto"),
+                    str("pad.assign.rumble.controller"),
+                    str("pad.assign.rumble.device"),
+                    str("pad.assign.rumble.off"),
+                )
+                pads.forEach { pad ->
+                    val pinnedPort = com.armsx2.input.PadRouter.pins()[pad.descriptor]
+                    SegmentedRow(
+                        label = pad.name,
+                        options = slotLabels,
+                        selectedIndex = (pinnedPort?.plus(1) ?: 0).coerceIn(0, slotLabels.lastIndex),
+                        onChange = { index ->
+                            com.armsx2.input.PadRouter.setPin(
+                                pad.descriptor,
+                                if (index == 0) null else index - 1,
+                            )
+                            refreshToken.intValue++
+                        },
+                    )
+                    // Where THIS pad's rumble goes. A controller can report motors it never
+                    // drives -- a handheld bridging an external pad through its own HID node
+                    // does exactly that -- and no API call can tell that apart from a working
+                    // motor, so the fallback has to be selectable rather than detected.
+                    SegmentedRow(
+                        label = pad.name + " — " + str("pad.assign.rumble"),
+                        options = rumbleLabels,
+                        selectedIndex = rumbleModes.indexOf(
+                            com.armsx2.input.PadRouter.rumbleMode(pad.descriptor),
+                        ).coerceAtLeast(0),
+                        onChange = { index ->
+                            com.armsx2.input.PadRouter.setRumbleMode(pad.descriptor, rumbleModes[index])
+                            refreshToken.intValue++
+                        },
+                    )
+                }
+                SettingsDivider()
+                // Taking the pad over on USB is the only way to reach a PlayStation controller's
+                // motors when the platform's own vibrator for it does nothing. It claims the
+                // pad's single HID interface, so input has to come through us too -- which is
+                // why it is a switch and not something done quietly on the user's behalf.
+                ToggleRow(
+                    str("pad.usbTakeover.label"),
+                    com.armsx2.input.UsbRumble.takeover,
+                    description = str("pad.usbTakeover.description"),
+                ) {
+                    com.armsx2.input.UsbRumble.setTakeover(it)
+                    refreshToken.intValue++
+                }
+                SettingsDivider()
+            }
+            // Escape hatch for pads Android will not drive. #433 stopped the phone buzzing for
+            // an external pad; #646 (same reporter) is the other half of that trade -- their
+            // Xbox pad exposes no motor, so suppressing the fallback left them with nothing.
+            // A handheld's own built-in pad is not external and never took this path.
+            ToggleRow(
+                str("pad.rumbleFallback.label"),
+                ControllerMappings.rumbleFallbackExternal(),
+                description = str("pad.rumbleFallback.description"),
+            ) { on ->
+                ControllerMappings.setRumbleFallbackExternal(on)
+                refreshToken.intValue++
+            }
+            SettingsDivider()
             // Buzz the selected player's controller and report whether Android can drive
             // its rumble — separates a routing problem from a pad whose haptics simply
             // aren't exposed to Android (common for DualSense/DS4 over Bluetooth).
@@ -333,123 +416,7 @@ fun PadTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
             }
             SettingsDivider()
         }
-        CollapsibleSection(str("pad.section.analogSticks"), initiallyExpanded = false) {
-            // Extra button on the ON-SCREEN left stick: a sprint/jump button just above it that
-            // you can reach by GLIDING the same thumb up off the stick, without lifting off and
-            // losing your heading (GTA / Silent Hill sprint, GoW / KH jump).
-            ToggleRow(
-                str("pad.analogExtra.label"),
-                com.armsx2.ui.touch.TouchControls.analogExtraEnabled.value,
-                description = str("pad.analogExtra.description"),
-            ) { com.armsx2.ui.touch.TouchControls.setAnalogExtraEnabled(it) }
-            if (com.armsx2.ui.touch.TouchControls.analogExtraEnabled.value) {
-                run {
-                    // Reuse the macro target table — it is exactly "every PS2 button a control may
-                    // fire", already ordered for display and already translated.
-                    val targets = com.armsx2.ui.touch.TouchControls.macroAssignableTargets
-                        .filter { it.code in 0..199 }
-                    val idx = targets.indexOfFirst {
-                        it.code == com.armsx2.ui.touch.TouchControls.analogExtraKeycode.intValue
-                    }.coerceAtLeast(0)
-                    SegmentedGridRow(
-                        label = str("pad.analogExtra.button"),
-                        options = targets.map { it.label },
-                        selectedIndex = idx,
-                        columns = 4,
-                        description = str("pad.analogExtra.button.description"),
-                        onChange = {
-                            com.armsx2.ui.touch.TouchControls.setAnalogExtraKeycode(targets[it].code)
-                        },
-                    )
-                }
-                SettingsDivider()
-            }
-            // Analog stick remapping — make a physical stick act as the D-pad or the
-            // face buttons (great for fighting games on analog-centric controllers).
-            run {
-                val stickOpts = ControllerMappings.StickMode.entries.map { it.label }
-                SegmentedRow(
-                    label = str("pad.leftStick.label"),
-                    options = stickOpts,
-                    selectedIndex = ControllerMappings.leftStickModeScope(editPlayer.intValue, editSerial).ordinal,
-                    description = str("pad.leftStick.description"),
-                    onChange = {
-                        ControllerMappings.setLeftStickMode(ControllerMappings.StickMode.entries[it], editPlayer.intValue, editSerial)
-                        refreshToken.intValue++
-                    },
-                )
-                SettingsDivider()
-                if (ControllerMappings.leftStickModeScope(editPlayer.intValue, editSerial) == ControllerMappings.StickMode.CUSTOM) {
-                    ControllerMappings.StickDir.entries.forEach { dir ->
-                        StickDirPickerRow(leftStick = true, dir = dir, player = editPlayer.intValue, serial = editSerial, onChanged = { refreshToken.intValue++ })
-                        SettingsDivider()
-                    }
-                }
-                // Axis correction for the LEFT stick — fixes pads that read mirrored/rotated.
-                ToggleRow(str("pad.leftStick.swapXY.label"), ControllerMappings.stickSwapXYScope(true, editSerial),
-                    description = str("pad.leftStick.swapXY.description")) {
-                    ControllerMappings.setStickSwapXY(true, it, editSerial); refreshToken.intValue++
-                }
-                SettingsDivider()
-                ToggleRow(str("pad.leftStick.invertX.label"), ControllerMappings.stickInvertXScope(true, editSerial),
-                    description = str("pad.leftStick.invertX.description")) {
-                    ControllerMappings.setStickInvertX(true, it, editSerial); refreshToken.intValue++
-                }
-                SettingsDivider()
-                ToggleRow(str("pad.leftStick.invertY.label"), ControllerMappings.stickInvertYScope(true, editSerial),
-                    description = str("pad.leftStick.invertY.description")) {
-                    ControllerMappings.setStickInvertY(true, it, editSerial); refreshToken.intValue++
-                }
-                SettingsDivider()
-                SegmentedRow(
-                    label = str("pad.rightStick.label"),
-                    options = stickOpts,
-                    selectedIndex = ControllerMappings.rightStickModeScope(editPlayer.intValue, editSerial).ordinal,
-                    description = str("pad.rightStick.description"),
-                    onChange = {
-                        ControllerMappings.setRightStickMode(ControllerMappings.StickMode.entries[it], editPlayer.intValue, editSerial)
-                        refreshToken.intValue++
-                    },
-                )
-                SettingsDivider()
-                if (ControllerMappings.rightStickModeScope(editPlayer.intValue, editSerial) == ControllerMappings.StickMode.CUSTOM) {
-                    ControllerMappings.StickDir.entries.forEach { dir ->
-                        StickDirPickerRow(leftStick = false, dir = dir, player = editPlayer.intValue, serial = editSerial, onChanged = { refreshToken.intValue++ })
-                        SettingsDivider()
-                    }
-                }
-                // Axis correction for the RIGHT stick — e.g. the tester's "down is up, left is right".
-                ToggleRow(str("pad.rightStick.swapXY.label"), ControllerMappings.stickSwapXYScope(false, editSerial),
-                    description = str("pad.rightStick.swapXY.description")) {
-                    ControllerMappings.setStickSwapXY(false, it, editSerial); refreshToken.intValue++
-                }
-                SettingsDivider()
-                ToggleRow(str("pad.rightStick.invertX.label"), ControllerMappings.stickInvertXScope(false, editSerial),
-                    description = str("pad.rightStick.invertX.description")) {
-                    ControllerMappings.setStickInvertX(false, it, editSerial); refreshToken.intValue++
-                }
-                SettingsDivider()
-                ToggleRow(str("pad.rightStick.invertY.label"), ControllerMappings.stickInvertYScope(false, editSerial),
-                    description = str("pad.rightStick.invertY.description")) {
-                    ControllerMappings.setStickInvertY(false, it, editSerial); refreshToken.intValue++
-                }
-                SettingsDivider()
-                ToggleRow(
-                    str("pad.dpadAsLeftStick.label"),
-                    ControllerMappings.dpadAsLeftStickScope(editSerial),
-                    description = str("pad.dpadAsLeftStick.description"),
-                ) {
-                    ControllerMappings.setDpadAsLeftStick(it, editSerial)
-                    refreshToken.intValue++
-                }
-                SettingsDivider()
-                // Stick FEEL is per-stick now (tester: lowering sensitivity for
-                // camera aim also slowed walking). Existing single-value settings
-                // migrate to both sticks automatically.
-                StickFeelSliders(left = true, title = str("pad.leftStickFeel.title"), refreshToken = refreshToken)
-                StickFeelSliders(left = false, title = str("pad.rightStickFeel.title"), refreshToken = refreshToken)
-            }
-        }
+        AnalogSticksSection(editPlayer, refreshToken, editSerial)
         // Motion / gyroscope controls. Shared with the in-game pause menu's Controls tab
         // (com.armsx2.ui.settings.GyroSection). Here it follows the Pad tab's Global/Game
         // scope (editSerial) and shares the tab's refreshToken so it re-reads live.
@@ -494,6 +461,38 @@ fun PadTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
                         Text(
                             if (turbo.value) "ON" else "OFF",
                             color = if (turbo.value) Color(0xFF4DA3FF)
+                            else Color(0xFF808080),
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    // Tap to hold (#612) — the on-screen buttons have always had this; an
+                    // accessibility request brought it to physical ones, for games that expect a
+                    // button held while another control is worked. Sits with Turbo because both
+                    // change what holding the button means, and both need a binding to act on.
+                    val latch = remember(action.id, editPlayer.intValue, refreshToken.intValue) {
+                        mutableStateOf(ControllerMappings.isLatchAction(action, editPlayer.intValue))
+                    }
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                val nv = !latch.value
+                                latch.value = nv
+                                ControllerMappings.setLatchAction(action, editPlayer.intValue, nv)
+                            }
+                            .padding(start = 18.dp, end = 10.dp, top = 2.dp, bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "\u21b3 Tap to hold (press once to hold, again to release)",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 14.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            if (latch.value) "ON" else "OFF",
+                            color = if (latch.value) Color(0xFF4DA3FF)
                             else Color(0xFF808080),
                             fontSize = 15.sp,
                             fontWeight = FontWeight.SemiBold,
@@ -1021,12 +1020,23 @@ private fun StickTargetPickerDialog(
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
             tonalElevation = 6.dp,
         ) {
-            Column(Modifier.padding(20.dp)) {
+            // Capped to the display so the weighted list above has a bounded height to share
+            // out; without this the Column is unbounded and weight() changes nothing.
+            Column(
+                Modifier
+                    .padding(20.dp)
+                    .heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.82f).dp),
+            ) {
                 Text(title, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 Column(
                     Modifier
-                        .heightIn(max = 360.dp)
+                        // Bounded by the SCREEN, not a fixed 360dp. In landscape the display is
+                        // shorter than 360dp plus a title plus a button row, so the list took
+                        // more than there was and pushed Save/Cancel off the bottom -- with no
+                        // way to commit or dismiss (reported for the macro editor). weight()
+                        // lets the buttons claim their height first and gives the list the rest.
+                        .weight(1f, fill = false)
                         .verticalScroll(rememberScrollState()),
                 ) {
                     Text(
@@ -1101,6 +1111,138 @@ private fun StickPickItem(label: String, selected: Boolean, id: String, onClick:
         )
     }
 }
+@androidx.compose.runtime.Composable
+/**
+ * Analog-stick settings, extracted so the in-game quick menu can host them too.
+ *
+ * Same arrangement as [GyroSection] and [MacrosSection] and for the same reason: some games
+ * have no in-game invert option, so needing All Settings to flip Y mid-session meant leaving
+ * the game (Sizor). The section itself is unchanged — it is called from both places.
+ */
+internal fun AnalogSticksSection(
+    editPlayer: androidx.compose.runtime.MutableIntState,
+    refreshToken: androidx.compose.runtime.MutableIntState,
+    editSerial: String? = null,
+) {
+    CollapsibleSection(str("pad.section.analogSticks"), initiallyExpanded = false) {
+        // Extra button on the ON-SCREEN left stick: a sprint/jump button just above it that
+        // you can reach by GLIDING the same thumb up off the stick, without lifting off and
+        // losing your heading (GTA / Silent Hill sprint, GoW / KH jump).
+        ToggleRow(
+            str("pad.analogExtra.label"),
+            com.armsx2.ui.touch.TouchControls.analogExtraEnabled.value,
+            description = str("pad.analogExtra.description"),
+        ) { com.armsx2.ui.touch.TouchControls.setAnalogExtraEnabled(it) }
+        if (com.armsx2.ui.touch.TouchControls.analogExtraEnabled.value) {
+            run {
+                // Reuse the macro target table — it is exactly "every PS2 button a control may
+                // fire", already ordered for display and already translated.
+                val targets = com.armsx2.ui.touch.TouchControls.macroAssignableTargets
+                    .filter { it.code in 0..199 }
+                val idx = targets.indexOfFirst {
+                    it.code == com.armsx2.ui.touch.TouchControls.analogExtraKeycode.intValue
+                }.coerceAtLeast(0)
+                SegmentedGridRow(
+                    label = str("pad.analogExtra.button"),
+                    options = targets.map { it.label },
+                    selectedIndex = idx,
+                    columns = 4,
+                    description = str("pad.analogExtra.button.description"),
+                    onChange = {
+                        com.armsx2.ui.touch.TouchControls.setAnalogExtraKeycode(targets[it].code)
+                    },
+                )
+            }
+            SettingsDivider()
+        }
+        // Analog stick remapping — make a physical stick act as the D-pad or the
+        // face buttons (great for fighting games on analog-centric controllers).
+        run {
+            val stickOpts = ControllerMappings.StickMode.entries.map { it.label }
+            SegmentedRow(
+                label = str("pad.leftStick.label"),
+                options = stickOpts,
+                selectedIndex = ControllerMappings.leftStickModeScope(editPlayer.intValue, editSerial).ordinal,
+                description = str("pad.leftStick.description"),
+                onChange = {
+                    ControllerMappings.setLeftStickMode(ControllerMappings.StickMode.entries[it], editPlayer.intValue, editSerial)
+                    refreshToken.intValue++
+                },
+            )
+            SettingsDivider()
+            if (ControllerMappings.leftStickModeScope(editPlayer.intValue, editSerial) == ControllerMappings.StickMode.CUSTOM) {
+                ControllerMappings.StickDir.entries.forEach { dir ->
+                    StickDirPickerRow(leftStick = true, dir = dir, player = editPlayer.intValue, serial = editSerial, onChanged = { refreshToken.intValue++ })
+                    SettingsDivider()
+                }
+            }
+            // Axis correction for the LEFT stick — fixes pads that read mirrored/rotated.
+            ToggleRow(str("pad.leftStick.swapXY.label"), ControllerMappings.stickSwapXYScope(true, editSerial),
+                description = str("pad.leftStick.swapXY.description")) {
+                ControllerMappings.setStickSwapXY(true, it, editSerial); refreshToken.intValue++
+            }
+            SettingsDivider()
+            ToggleRow(str("pad.leftStick.invertX.label"), ControllerMappings.stickInvertXScope(true, editSerial),
+                description = str("pad.leftStick.invertX.description")) {
+                ControllerMappings.setStickInvertX(true, it, editSerial); refreshToken.intValue++
+            }
+            SettingsDivider()
+            ToggleRow(str("pad.leftStick.invertY.label"), ControllerMappings.stickInvertYScope(true, editSerial),
+                description = str("pad.leftStick.invertY.description")) {
+                ControllerMappings.setStickInvertY(true, it, editSerial); refreshToken.intValue++
+            }
+            SettingsDivider()
+            SegmentedRow(
+                label = str("pad.rightStick.label"),
+                options = stickOpts,
+                selectedIndex = ControllerMappings.rightStickModeScope(editPlayer.intValue, editSerial).ordinal,
+                description = str("pad.rightStick.description"),
+                onChange = {
+                    ControllerMappings.setRightStickMode(ControllerMappings.StickMode.entries[it], editPlayer.intValue, editSerial)
+                    refreshToken.intValue++
+                },
+            )
+            SettingsDivider()
+            if (ControllerMappings.rightStickModeScope(editPlayer.intValue, editSerial) == ControllerMappings.StickMode.CUSTOM) {
+                ControllerMappings.StickDir.entries.forEach { dir ->
+                    StickDirPickerRow(leftStick = false, dir = dir, player = editPlayer.intValue, serial = editSerial, onChanged = { refreshToken.intValue++ })
+                    SettingsDivider()
+                }
+            }
+            // Axis correction for the RIGHT stick — e.g. the tester's "down is up, left is right".
+            ToggleRow(str("pad.rightStick.swapXY.label"), ControllerMappings.stickSwapXYScope(false, editSerial),
+                description = str("pad.rightStick.swapXY.description")) {
+                ControllerMappings.setStickSwapXY(false, it, editSerial); refreshToken.intValue++
+            }
+            SettingsDivider()
+            ToggleRow(str("pad.rightStick.invertX.label"), ControllerMappings.stickInvertXScope(false, editSerial),
+                description = str("pad.rightStick.invertX.description")) {
+                ControllerMappings.setStickInvertX(false, it, editSerial); refreshToken.intValue++
+            }
+            SettingsDivider()
+            ToggleRow(str("pad.rightStick.invertY.label"), ControllerMappings.stickInvertYScope(false, editSerial),
+                description = str("pad.rightStick.invertY.description")) {
+                ControllerMappings.setStickInvertY(false, it, editSerial); refreshToken.intValue++
+            }
+            SettingsDivider()
+            ToggleRow(
+                str("pad.dpadAsLeftStick.label"),
+                ControllerMappings.dpadAsLeftStickScope(editSerial),
+                description = str("pad.dpadAsLeftStick.description"),
+            ) {
+                ControllerMappings.setDpadAsLeftStick(it, editSerial)
+                refreshToken.intValue++
+            }
+            SettingsDivider()
+            // Stick FEEL is per-stick now (tester: lowering sensitivity for
+            // camera aim also slowed walking). Existing single-value settings
+            // migrate to both sticks automatically.
+            StickFeelSliders(left = true, title = str("pad.leftStickFeel.title"), refreshToken = refreshToken)
+            StickFeelSliders(left = false, title = str("pad.rightStickFeel.title"), refreshToken = refreshToken)
+        }
+    }
+}
+
 
 /**
  * Motion / gyroscope controls, shared by the Pad settings tab and the in-game pause
@@ -1354,7 +1496,13 @@ private fun MacroConfigDialog(
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
             tonalElevation = 6.dp,
         ) {
-            Column(Modifier.padding(20.dp)) {
+            // Capped to the display so the weighted list above has a bounded height to share
+            // out; without this the Column is unbounded and weight() changes nothing.
+            Column(
+                Modifier
+                    .padding(20.dp)
+                    .heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.82f).dp),
+            ) {
                 Text(
                     "${str("pad.action.edit")}: ${macroId.label}",
                     color = MaterialTheme.colorScheme.onSurface,
@@ -1364,7 +1512,12 @@ private fun MacroConfigDialog(
                 // Plain Column, not Lazy — see the note on the stick picker.
                 Column(
                     Modifier
-                        .heightIn(max = 360.dp)
+                        // Bounded by the SCREEN, not a fixed 360dp. In landscape the display is
+                        // shorter than 360dp plus a title plus a button row, so the list took
+                        // more than there was and pushed Save/Cancel off the bottom -- with no
+                        // way to commit or dismiss (reported for the macro editor). weight()
+                        // lets the buttons claim their height first and gives the list the rest.
+                        .weight(1f, fill = false)
                         .verticalScroll(rememberScrollState()),
                 ) {
                     Text(
